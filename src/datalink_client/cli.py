@@ -22,7 +22,10 @@ DataLink interactive client commands:
   POSITION AFTER <us>        - Set read position after time (epoch microseconds)
   READ <pktid>               - Read a specific packet by ID
   STREAM                     - Start streaming (Ctrl+C to stop)
-  INFO <type> [match]        - Request info (STATUS, STREAMS, CONNECTIONS)
+  STATUS [match]             - Print formatted server status
+  STREAMS [match]            - Print formatted stream list
+  CONNECTIONS [match]        - Print formatted connection list
+  INFO <type> [match]        - Request info and print raw XML
   QUIT / EXIT                - Disconnect and exit (or Ctrl+D or Ctrl+C)
 
   All commands are case-insensitive.
@@ -129,16 +132,24 @@ def _print_info_streams(info: dict[str, Any]) -> None:
         print(f"{_fmt(sel)} of {_fmt(total)} streams")
         return
 
+    col1_h, col2_h, col3_h, col4_h = "Stream ID", "Earliest Packet", "Latest Packet", "Latency"
+    sep = "  "
+    # Compute column widths from header and data
+    w1 = max(len(col1_h), max(len(_fmt(s.get("Name"))) for s in streams)) + 2
+    w2 = max(len(col2_h), max(len(_fmt(s.get("EarliestPacketDataStartTime"))) for s in streams))
+    w3 = max(len(col3_h), max(len(_fmt(s.get("LatestPacketDataStartTime"))) for s in streams))
+    latency_lengths = [len(f"{s.get('DataLatency')} seconds") if s.get("DataLatency") is not None else 1 for s in streams]
+    w4 = max(len(col4_h), max(latency_lengths))
     print()
-    print("Stream ID  Earliest Packet  Latest Packet  Latency")
-    print("-" * 20 + "  " + "-" * 20 + "  " + "-" * 20 + "  " + "-" * 10)
+    print(f"{col1_h:<{w1}}{sep}{col2_h:<{w2}}{sep}{col3_h:<{w3}}{sep}{col4_h:<{w4}}")
+    print("-" * w1 + sep + "-" * w2 + sep + "-" * w3 + sep + "-" * w4)
     for s in streams:
         name = _fmt(s.get("Name"))
         earliest_start = _fmt(s.get("EarliestPacketDataStartTime"))
         latest_start = _fmt(s.get("LatestPacketDataStartTime"))
         latency = s.get("DataLatency")
         latency_str = f"{latency} seconds" if latency is not None else "-"
-        print(f"{name}  {earliest_start}  {latest_start}  {latency_str}")
+        print(f"{name:<{w1}}{sep}{earliest_start:<{w2}}{sep}{latest_start:<{w3}}{sep}{latency_str:<{w4}}")
 
     total = slist.get("TotalStreams")
     sel = slist.get("SelectedStreams")
@@ -447,21 +458,29 @@ def _run_command(dl: DataLink, cmd: str, parts: list[str]) -> bool:
         _run_stream(dl)
         return True
 
+    if cmd == "STATUS":
+        match_expr = " ".join(parts[1:]).strip() or None if len(parts) > 1 else None
+        _print_info_status(dl.info_status(match=match_expr))
+        return True
+
+    if cmd == "STREAMS":
+        match_expr = " ".join(parts[1:]).strip() or None if len(parts) > 1 else None
+        _print_info_streams(dl.info_streams(match=match_expr))
+        return True
+
+    if cmd == "CONNECTIONS":
+        match_expr = " ".join(parts[1:]).strip() or None if len(parts) > 1 else None
+        _print_info_connections(dl.info_connections(match=match_expr))
+        return True
+
     if cmd == "INFO":
         if len(parts) < 2:
-            print("Usage: INFO <STATUS|STREAMS|CONNECTIONS> [match]")
+            print("Usage: INFO <type> [match]")
             return True
         info_type = parts[1].upper()
         match_expr = " ".join(parts[2:]).strip() or None if len(parts) > 2 else None
-        if info_type == "STATUS":
-            _print_info_status(dl.info_status(match=match_expr))
-        elif info_type == "STREAMS":
-            _print_info_streams(dl.info_streams(match=match_expr))
-        elif info_type == "CONNECTIONS":
-            _print_info_connections(dl.info_connections(match=match_expr))
-        else:
-            xml = dl.info(info_type, match_expr)
-            print(xml)
+        xml = dl.info(info_type, match_expr)
+        print(xml)
         return True
 
     print(f"Unknown command: {cmd}  (type HELP for usage)")

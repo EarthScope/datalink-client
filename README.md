@@ -1,6 +1,6 @@
 # datalink-client
 
-DataLink protocol 1.1 client for reading and writing data using the DataLink protocol. DataLink is a simple, packet-based streaming protocol used in seismological data systems, primarily with EarthScope's [ringserver](https://github.com/earthscope/ringserver) software.
+DataLink protocol client for reading and writing data using the DataLink protocol. DataLink is a simple, packet-based streaming protocol used in seismological data systems, primarily with EarthScope's [ringserver](https://github.com/earthscope/ringserver) software.
 
 ## Installation
 
