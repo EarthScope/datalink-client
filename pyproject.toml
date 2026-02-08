@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "datalink-client"
+dynamic = ["version"]
+description = "DataLink protocol 1.1 client for reading and writing data using the DataLink protocol (e.g. EarthScope ringserver)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = []
+keywords = ["datalink", "seismology", "ringserver", "earthscope"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.scripts]
+datalink-client = "datalink_client:main"
+
+[tool.hatch.version]
+path = "src/datalink_client/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/datalink_client"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/datalink_client"]
