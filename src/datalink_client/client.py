@@ -47,6 +47,8 @@ class DataLink:
     Attributes:
         server_id:           Raw server ID string after calling :meth:`identify`, or None.
         server_capabilities: Dict of server capabilities parsed from the ID reply.
+                             Keys with values are stored as strings (e.g. ``{'DLPROTO': '1.0'}``).
+                             Keys without values are stored as ``True`` (e.g. ``{'WRITE': True}``).
     """
 
     TLS_PORT = 16500
@@ -67,7 +69,7 @@ class DataLink:
         self._sock: socket.socket | None = None
         self._streaming = False
         self.server_id: str | None = None
-        self.server_capabilities: dict[str, str] = {}
+        self.server_capabilities: dict[str, str | bool] = {}
 
     @classmethod
     def from_server_string(
@@ -354,7 +356,7 @@ class DataLink:
                     key, value = token.split(":", 1)
                     self.server_capabilities[key] = value
                 else:
-                    self.server_capabilities[token] = ""
+                    self.server_capabilities[token] = True
         return raw
 
     def auth_userpass(self, username: str, password: str) -> DataLinkResponse:
