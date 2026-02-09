@@ -1,7 +1,8 @@
-"""Interactive command-line DataLink client."""
+"""Interactive command-line DataLink client using cmd.Cmd."""
 
 from __future__ import annotations
 
+import cmd
 import sys
 from typing import Any
 
@@ -10,27 +11,9 @@ from .protocol import DataLinkError, DataLinkPacket
 from .time_utils import ustime_to_timestring
 
 
-_HELP_TEXT = """\
-DataLink interactive client commands:
-
-  ID [name]                  - Send identification (default: auto-generated)
-  AUTH USERPASS <user> <pass> - Authenticate with username and password
-  AUTH JWT <token>           - Authenticate with a JSON Web Token
-  MATCH <pattern>            - Set match expression (e.g. IU_ANMO.*)
-  REJECT <pattern>           - Set reject expression
-  POSITION SET <pktid> <us>  - Set read position (pktid: int, EARLIEST, LATEST)
-  POSITION AFTER <us>        - Set read position after time (epoch microseconds)
-  READ <pktid>               - Read a specific packet by ID
-  STREAM                     - Start streaming (Ctrl+C to stop)
-  STATUS [match]             - Print formatted server status
-  STREAMS [match]            - Print formatted stream list
-  CONNECTIONS [match]        - Print formatted connection list
-  INFO <type> [match]        - Request info and print raw XML
-  QUIT / EXIT                - Disconnect and exit (or Ctrl+D or Ctrl+C)
-
-  All commands are case-insensitive.
-"""
-
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
 
 def _print_packet(pkt: DataLinkPacket) -> None:
     print(
@@ -50,7 +33,6 @@ def _fmt(v: Any) -> str:
 
 
 def _print_info_status(info: dict[str, Any]) -> None:
-    """Format STATUS info in dalitool-style human-readable output."""
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -116,7 +98,6 @@ def _print_info_status(info: dict[str, Any]) -> None:
 
 
 def _print_info_streams(info: dict[str, Any]) -> None:
-    """Format STREAMS info in dalitool-style table."""
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -134,7 +115,6 @@ def _print_info_streams(info: dict[str, Any]) -> None:
 
     col1_h, col2_h, col3_h, col4_h = "Stream ID", "Earliest Packet", "Latest Packet", "Latency"
     sep = "  "
-    # Compute column widths from header and data
     w1 = max(len(col1_h), max(len(_fmt(s.get("Name"))) for s in streams)) + 2
     w2 = max(len(col2_h), max(len(_fmt(s.get("EarliestPacketDataStartTime"))) for s in streams))
     w3 = max(len(col3_h), max(len(_fmt(s.get("LatestPacketDataStartTime"))) for s in streams))
@@ -157,7 +137,6 @@ def _print_info_streams(info: dict[str, Any]) -> None:
 
 
 def _print_info_connections(info: dict[str, Any]) -> None:
-    """Format CONNECTIONS info in dalitool-style per-connection blocks."""
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -237,260 +216,330 @@ def _print_info_connections(info: dict[str, Any]) -> None:
     print(f"{_fmt(sel)} of {_fmt(total)} connections")
 
 
-def _print_info_dict(info: dict[str, Any], indent: int = 0) -> None:
-    """Fallback: pretty-print generic INFO dict (e.g. raw or unknown type)."""
-    prefix = "  " * indent
-    for key, value in info.items():
-        if isinstance(value, dict):
-            print(f"{prefix}{key}:")
-            _print_info_dict(value, indent + 1)
-        elif isinstance(value, list):
-            print(f"{prefix}{key}: ({len(value)} entries)")
-            for item in value:
-                if isinstance(item, dict):
-                    _print_info_dict(item, indent + 1)
-                    if indent < 2:
-                        print()
-                else:
-                    print(f"{prefix}  {item}")
-        elif value is None:
-            print(f"{prefix}{key}: -")
-        else:
-            print(f"{prefix}{key}: {value}")
+# ---------------------------------------------------------------------------
+# Auth credentials for reconnect
+# ---------------------------------------------------------------------------
 
-
-def _run_stream(dl: DataLink) -> None:
-    import select
-
-    dl.stream()
-    print("Streaming... press Enter or Ctrl+C to stop.")
-    try:
-        while True:
-            readable, _, _ = select.select([dl._sock, sys.stdin], [], [], 1.0)
-            if sys.stdin in readable:
-                sys.stdin.readline()
-                break
-            if dl._sock in readable:
-                header, data = dl._recv_packet()
-                packet_type = header.split(None, 1)[0] if header else ""
-                if packet_type == "PACKET":
-                    try:
-                        _print_packet(dl._parse_packet(header, data))
-                    except DataLinkError:
-                        pass
-                elif packet_type == "ENDSTREAM":
-                    dl._streaming = False
-                    print("Server ended stream.")
-                    return
-                elif packet_type == "ERROR":
-                    resp = dl._parse_response(header, data)
-                    raise DataLinkError(resp.message or "Stream error", resp.value)
-    except KeyboardInterrupt:
-        print()
-    try:
-        dl.endstream()
-        print("Returned to query mode.")
-    except DataLinkError:
-        pass
-
-
-# Auth credentials for reconnect: None, or ("userpass", user, password), or ("jwt", token)
+# None, or ("userpass", user, password), or ("jwt", token)
 AuthCredentials = None | tuple[str, str, str] | tuple[str, str]
 
 
-def _ensure_connected(dl: DataLink, auth: AuthCredentials) -> bool:
-    """Reconnect and re-identify (and re-auth if auth given). Returns True if we reconnected."""
-    if dl.is_connected:
+# ---------------------------------------------------------------------------
+# cmd.Cmd-based interactive client
+# ---------------------------------------------------------------------------
+
+class DataLinkShell(cmd.Cmd):
+    """Interactive DataLink command shell."""
+
+    prompt = "DL> "
+    intro = ""
+
+    def __init__(self, dl: DataLink, auth: AuthCredentials = None) -> None:
+        super().__init__()
+        self.dl = dl
+        self.auth = auth
+
+    # -- Connection management ---------------------------------------------
+
+    def _ensure_connected(self) -> bool:
+        """Reconnect if needed. Returns True if reconnected."""
+        if self.dl.is_connected:
+            return False
+        self.dl.connect()
+        self.dl.identify()
+        if self.auth is not None:
+            if self.auth[0] == "userpass":
+                self.dl.auth_userpass(self.auth[1], self.auth[2])
+            else:
+                self.dl.auth_jwt(self.auth[1])
+        return True
+
+    def _with_reconnect(self, func: Any) -> None:
+        """Run func(); on connection error, reconnect once and retry."""
+        for attempt in range(2):
+            try:
+                if self._ensure_connected():
+                    tls_label = " (TLS)" if self.dl._tls else ""
+                    print(f"Reconnected to {self.dl._host}:{self.dl._port}{tls_label}")
+                func()
+                return
+            except DataLinkError as e:
+                msg = str(e)
+                if attempt == 0 and ("Connection closed" in msg or "Not connected" in msg):
+                    try:
+                        if self._ensure_connected():
+                            tls_label = " (TLS)" if self.dl._tls else ""
+                            print(f"Reconnected to {self.dl._host}:{self.dl._port}{tls_label}")
+                            continue
+                    except DataLinkError:
+                        pass
+                print(f"Error: {e}")
+                return
+
+    # -- Case-insensitive command dispatch ---------------------------------
+
+    def parseline(self, line: str) -> tuple[str | None, str | None, str]:
+        """Override to make commands case-insensitive."""
+        cmd_name, arg, line = super().parseline(line)
+        if cmd_name is not None:
+            cmd_name = cmd_name.lower()
+        return cmd_name, arg, line
+
+    def emptyline(self) -> bool:
+        """Don't repeat last command on empty line."""
         return False
-    dl.connect()
-    dl.identify()
-    if auth is not None:
-        if auth[0] == "userpass":
-            dl.auth_userpass(auth[1], auth[2])
-        else:
-            dl.auth_jwt(auth[1])
-    return True
 
+    def default(self, line: str) -> None:
+        print(f"Unknown command: {line.split()[0]}  (type HELP for commands)")
 
-def _handle_command(dl: DataLink, line: str, auth: AuthCredentials = None) -> bool:
-    parts = line.split()
-    if not parts:
-        return True
-    cmd = parts[0].upper()
+    # -- Commands ----------------------------------------------------------
 
-    if cmd in ("QUIT", "EXIT"):
-        return False
+    def do_id(self, arg: str) -> None:
+        """ID [name] - Send identification"""
+        def run() -> None:
+            name = arg.strip() or None
+            self.dl.identify(name)
+            print(f"Server: {self.dl.server_id}")
+            if self.dl.server_capabilities:
+                print(f"Capabilities: {self.dl.server_capabilities}")
+        self._with_reconnect(run)
 
-    if cmd == "HELP":
-        print(_HELP_TEXT)
-        return True
-
-    # Commands below need a live connection; reconnect if closed
-    try:
-        if _ensure_connected(dl, auth):
-            tls_label = " (TLS)" if dl._tls else ""
-            print(f"Reconnected to {dl._host}:{dl._port}{tls_label}")
-    except DataLinkError as e:
-        print(f"Error: {e}")
-        return True
-
-    # Run command with one retry on connection closed (so user doesn't have to re-enter)
-    for attempt in range(2):
-        try:
-            return _run_command(dl, cmd, parts)
-        except DataLinkError as e:
-            msg = str(e)
-            if attempt == 0 and ("Connection closed" in msg or "Not connected" in msg):
-                try:
-                    if _ensure_connected(dl, auth):
-                        tls_label = " (TLS)" if dl._tls else ""
-                        print(f"Reconnected to {dl._host}:{dl._port}{tls_label}")
-                        continue  # retry command
-                except DataLinkError:
-                    pass
-            print(f"Error: {e}")
-            return True
-
-    return True
-
-
-def _run_command(dl: DataLink, cmd: str, parts: list[str]) -> bool:
-    """Execute a single command. Raises DataLinkError on connection errors."""
-    if cmd == "ID":
-        name = parts[1] if len(parts) > 1 else None
-        server_id = dl.identify(name)
-        print(f"Server: {server_id}")
-        if dl.server_capabilities:
-            print(f"Capabilities: {dl.server_capabilities}")
-        return True
-
-    if cmd == "AUTH":
-        if len(parts) < 2:
+    def do_auth(self, arg: str) -> None:
+        """AUTH USERPASS <user> <pass> | AUTH JWT <token> - Authenticate"""
+        parts = arg.split()
+        if len(parts) < 1:
             print("Usage: AUTH USERPASS <user> <pass>  or  AUTH JWT <token>")
-            return True
-        subcmd = parts[1].upper()
-        if subcmd == "USERPASS":
-            if len(parts) < 4:
-                print("Usage: AUTH USERPASS <username> <password>")
-                return True
-            resp = dl.auth_userpass(parts[2], parts[3])
-            print(
-                f"OK: authenticated as {parts[2]}" if resp else f"ERROR: {resp.message}"
-            )
-        elif subcmd == "JWT":
-            if len(parts) < 3:
-                print("Usage: AUTH JWT <token>")
-                return True
-            resp = dl.auth_jwt(parts[2])
-            print("OK: authenticated with JWT" if resp else f"ERROR: {resp.message}")
-        else:
-            print("Usage: AUTH USERPASS <user> <pass>  or  AUTH JWT <token>")
-        return True
+            return
+        subcmd = parts[0].upper()
+        def run() -> None:
+            if subcmd == "USERPASS":
+                if len(parts) < 3:
+                    print("Usage: AUTH USERPASS <username> <password>")
+                    return
+                resp = self.dl.auth_userpass(parts[1], parts[2])
+                print(f"OK: authenticated as {parts[1]}" if resp else f"ERROR: {resp.message}")
+            elif subcmd == "JWT":
+                if len(parts) < 2:
+                    print("Usage: AUTH JWT <token>")
+                    return
+                resp = self.dl.auth_jwt(parts[1])
+                print("OK: authenticated with JWT" if resp else f"ERROR: {resp.message}")
+            else:
+                print("Usage: AUTH USERPASS <user> <pass>  or  AUTH JWT <token>")
+        self._with_reconnect(run)
 
-    if cmd == "MATCH":
-        if len(parts) < 2:
+    def complete_auth(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        subs = ["USERPASS", "JWT"]
+        return [s for s in subs if s.lower().startswith(text.lower())]
+
+    def do_match(self, arg: str) -> None:
+        """MATCH <pattern> - Set match expression"""
+        if not arg.strip():
             print("Usage: MATCH <pattern>")
-            return True
-        resp = dl.match(parts[1])
-        print(f"OK: {resp.value} streams matched" if resp else f"ERROR: {resp.message}")
-        return True
+            return
+        def run() -> None:
+            resp = self.dl.match(arg.strip())
+            print(f"OK: {resp.value} streams matched" if resp else f"ERROR: {resp.message}")
+        self._with_reconnect(run)
 
-    if cmd == "REJECT":
-        if len(parts) < 2:
+    def do_reject(self, arg: str) -> None:
+        """REJECT <pattern> - Set reject expression"""
+        if not arg.strip():
             print("Usage: REJECT <pattern>")
-            return True
-        resp = dl.reject(parts[1])
-        print(
-            f"OK: {resp.value} streams rejected" if resp else f"ERROR: {resp.message}"
-        )
-        return True
+            return
+        def run() -> None:
+            resp = self.dl.reject(arg.strip())
+            print(f"OK: {resp.value} streams rejected" if resp else f"ERROR: {resp.message}")
+        self._with_reconnect(run)
 
-    if cmd == "POSITION":
-        if len(parts) < 3:
-            print(
-                "Usage: POSITION SET <pktid> <uspkttime>  or  POSITION AFTER <ustime>"
-            )
-            return True
-        subcmd = parts[1].upper()
-        if subcmd == "SET" and len(parts) >= 4:
-            pktid: str | int = parts[2]
-            if pktid not in ("EARLIEST", "LATEST"):
+    def do_position(self, arg: str) -> None:
+        """POSITION SET <pktid> <us> | POSITION AFTER <us> - Set read position"""
+        parts = arg.split()
+        if len(parts) < 2:
+            print("Usage: POSITION SET <pktid> <uspkttime>  or  POSITION AFTER <ustime>")
+            return
+        subcmd = parts[0].upper()
+        def run() -> None:
+            if subcmd == "SET" and len(parts) >= 3:
+                pktid: str | int = parts[1]
+                if pktid not in ("EARLIEST", "LATEST"):
+                    try:
+                        pktid = int(pktid)
+                    except ValueError:
+                        print(f"Invalid pktid: {parts[1]}")
+                        return
                 try:
-                    pktid = int(pktid)
+                    uspkttime = int(parts[2])
                 except ValueError:
-                    print(f"Invalid pktid: {parts[2]}")
-                    return True
-            try:
-                uspkttime = int(parts[3])
-            except ValueError:
-                print(f"Invalid uspkttime: {parts[3]}")
-                return True
-            resp = dl.position_set(pktid, uspkttime)
-            print(f"OK: position set to pktid={resp.value}")
-        elif subcmd == "AFTER":
-            try:
-                ustime = int(parts[2])
-            except ValueError:
-                print(f"Invalid ustime: {parts[2]}")
-                return True
-            resp = dl.position_after(ustime)
-            print(f"OK: position set to pktid={resp.value}")
-        else:
-            print(
-                "Usage: POSITION SET <pktid> <uspkttime>  or  POSITION AFTER <ustime>"
-            )
-        return True
+                    print(f"Invalid uspkttime: {parts[2]}")
+                    return
+                resp = self.dl.position_set(pktid, uspkttime)
+                print(f"OK: position set to pktid={resp.value}")
+            elif subcmd == "AFTER":
+                try:
+                    ustime = int(parts[1])
+                except ValueError:
+                    print(f"Invalid ustime: {parts[1]}")
+                    return
+                resp = self.dl.position_after(ustime)
+                print(f"OK: position set to pktid={resp.value}")
+            else:
+                print("Usage: POSITION SET <pktid> <uspkttime>  or  POSITION AFTER <ustime>")
+        self._with_reconnect(run)
 
-    if cmd == "READ":
-        if len(parts) < 2:
+    def complete_position(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        parts = line.split()
+        if len(parts) == 2 or (len(parts) == 1 and line.endswith(" ")):
+            subs = ["SET", "AFTER"]
+            return [s for s in subs if s.lower().startswith(text.lower())]
+        upper = line.upper()
+        if "POSITION SET" in upper:
+            words_after_set = upper.split("SET", 1)[1].split()
+            if len(words_after_set) == 0 or (len(words_after_set) == 1 and not line.endswith(" ")):
+                subs = ["EARLIEST", "LATEST"]
+                return [s for s in subs if s.lower().startswith(text.lower())]
+        return []
+
+    def do_read(self, arg: str) -> None:
+        """READ <pktid> - Read a specific packet by ID"""
+        if not arg.strip():
             print("Usage: READ <pktid>")
-            return True
+            return
         try:
-            pkt_id = int(parts[1])
+            pkt_id = int(arg.strip())
         except ValueError:
-            print(f"Error: invalid pktid {parts[1]}")
-            return True
-        pkt = dl.read(pkt_id)
-        _print_packet(pkt)
-        return True
+            print(f"Error: invalid pktid {arg.strip()}")
+            return
+        def run() -> None:
+            pkt = self.dl.read(pkt_id)
+            _print_packet(pkt)
+        self._with_reconnect(run)
 
-    if cmd == "STREAM":
-        _run_stream(dl)
-        return True
+    def do_stream(self, arg: str) -> None:
+        """STREAM - Start streaming (Ctrl+C to stop)"""
+        import select
 
-    if cmd == "STATUS":
-        match_expr = " ".join(parts[1:]).strip() or None if len(parts) > 1 else None
-        _print_info_status(dl.info_status(match=match_expr))
-        return True
+        try:
+            self._ensure_connected()
+        except DataLinkError as e:
+            print(f"Error: {e}")
+            return
 
-    if cmd == "STREAMS":
-        match_expr = " ".join(parts[1:]).strip() or None if len(parts) > 1 else None
-        _print_info_streams(dl.info_streams(match=match_expr))
-        return True
+        self.dl.stream()
+        print("Streaming... press Enter or Ctrl+C to stop.")
+        try:
+            while True:
+                readable, _, _ = select.select([self.dl._sock, sys.stdin], [], [], 1.0)
+                if sys.stdin in readable:
+                    sys.stdin.readline()
+                    break
+                if self.dl._sock in readable:
+                    header, data = self.dl._recv_packet()
+                    packet_type = header.split(None, 1)[0] if header else ""
+                    if packet_type == "PACKET":
+                        try:
+                            _print_packet(self.dl._parse_packet(header, data))
+                        except DataLinkError:
+                            pass
+                    elif packet_type == "ENDSTREAM":
+                        self.dl._streaming = False
+                        print("Server ended stream.")
+                        return
+                    elif packet_type == "ERROR":
+                        resp = self.dl._parse_response(header, data)
+                        raise DataLinkError(resp.message or "Stream error", resp.value)
+        except KeyboardInterrupt:
+            print()
+        try:
+            self.dl.endstream()
+            print("Returned to query mode.")
+        except DataLinkError:
+            pass
 
-    if cmd == "CONNECTIONS":
-        match_expr = " ".join(parts[1:]).strip() or None if len(parts) > 1 else None
-        _print_info_connections(dl.info_connections(match=match_expr))
-        return True
+    def do_status(self, arg: str) -> None:
+        """STATUS [match] - Print formatted server status"""
+        match_expr = arg.strip() or None
+        def run() -> None:
+            _print_info_status(self.dl.info_status(match=match_expr))
+        self._with_reconnect(run)
 
-    if cmd == "INFO":
-        if len(parts) < 2:
+    def do_streams(self, arg: str) -> None:
+        """STREAMS [match] - Print formatted stream list"""
+        match_expr = arg.strip() or None
+        def run() -> None:
+            _print_info_streams(self.dl.info_streams(match=match_expr))
+        self._with_reconnect(run)
+
+    def do_connections(self, arg: str) -> None:
+        """CONNECTIONS [match] - Print formatted connection list"""
+        match_expr = arg.strip() or None
+        def run() -> None:
+            _print_info_connections(self.dl.info_connections(match=match_expr))
+        self._with_reconnect(run)
+
+    def do_info(self, arg: str) -> None:
+        """INFO <type> [match] - Request info and print raw XML"""
+        parts = arg.split(None, 1)
+        if not parts:
             print("Usage: INFO <type> [match]")
-            return True
-        info_type = parts[1].upper()
-        match_expr = " ".join(parts[2:]).strip() or None if len(parts) > 2 else None
-        xml = dl.info(info_type, match_expr)
-        print(xml)
+            return
+        info_type = parts[0].upper()
+        match_expr = parts[1].strip() if len(parts) > 1 else None
+        def run() -> None:
+            xml = self.dl.info(info_type, match_expr)
+            print(xml)
+        self._with_reconnect(run)
+
+    def complete_info(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        subs = ["STATUS", "STREAMS", "CONNECTIONS"]
+        return [s for s in subs if s.lower().startswith(text.lower())]
+
+    def do_quit(self, arg: str) -> bool:
+        """QUIT - Disconnect and exit"""
         return True
 
-    print(f"Unknown command: {cmd}  (type HELP for usage)")
-    return True
+    def do_exit(self, arg: str) -> bool:
+        """EXIT - Disconnect and exit"""
+        return True
 
+    def do_EOF(self, arg: str) -> bool:
+        """Handle Ctrl+D."""
+        print()
+        return True
+
+    # -- Help override for clean formatting --------------------------------
+
+    def do_help(self, arg: str) -> None:
+        """HELP - Show available commands"""
+        print(
+            "DataLink interactive client commands:\n"
+            "\n"
+            "  ID [name]                  - Send identification (default: auto-generated)\n"
+            "  AUTH USERPASS <user> <pass> - Authenticate with username and password\n"
+            "  AUTH JWT <token>           - Authenticate with a JSON Web Token\n"
+            "  MATCH <pattern>            - Set match expression (e.g. IU_ANMO.*)\n"
+            "  REJECT <pattern>           - Set reject expression\n"
+            "  POSITION SET <pktid> <us>  - Set read position (pktid: int, EARLIEST, LATEST)\n"
+            "  POSITION AFTER <us>        - Set read position after time (epoch microseconds)\n"
+            "  READ <pktid>               - Read a specific packet by ID\n"
+            "  STREAM                     - Start streaming (Ctrl+C to stop)\n"
+            "  STATUS [match]             - Print formatted server status\n"
+            "  STREAMS [match]            - Print formatted stream list\n"
+            "  CONNECTIONS [match]        - Print formatted connection list\n"
+            "  INFO <type> [match]        - Request info and print raw XML\n"
+            "  QUIT / EXIT                - Disconnect and exit (or Ctrl+D or Ctrl+C)\n"
+            "\n"
+            "  All commands are case-insensitive. Tab completion is supported.\n"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> int:
     """Interactive DataLink client entry point."""
     import argparse
-    import readline  # noqa: F401 — enables arrow keys and history
 
     parser = argparse.ArgumentParser(
         description="Interactive DataLink protocol client.",
@@ -534,7 +583,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # Build auth credentials for reconnect-after-close
+    # Build auth credentials for reconnect
     auth: AuthCredentials = None
     if args.auth:
         auth_parts = args.auth.split(":", 1)
@@ -556,6 +605,7 @@ def main() -> int:
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+
     try:
         dl.connect()
         tls_label = " (TLS)" if dl._tls else ""
@@ -574,16 +624,13 @@ def main() -> int:
             else:
                 resp = dl.auth_jwt(auth[1])
                 print("Authenticated with JWT" if resp else f"Auth failed: {resp.message}")
-        print("Type HELP for commands, QUIT to exit.\n")
 
-        while True:
-            try:
-                line = input("DL> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if not _handle_command(dl, line, auth):
-                break
+        shell = DataLinkShell(dl, auth)
+        print("Type HELP for commands, QUIT to exit.\n")
+        try:
+            shell.cmdloop()
+        except KeyboardInterrupt:
+            print()
     except DataLinkError as e:
         msg = str(e)
         if "tls_noverify=True" in msg:
