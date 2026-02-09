@@ -279,9 +279,9 @@ class DataLinkShell(cmd.Cmd):
     # -- Case-insensitive command dispatch ---------------------------------
 
     def parseline(self, line: str) -> tuple[str | None, str | None, str]:
-        """Override to make commands case-insensitive."""
+        """Override to make commands case-insensitive (preserving 'EOF' for Ctrl+D)."""
         cmd_name, arg, line = super().parseline(line)
-        if cmd_name is not None:
+        if cmd_name is not None and cmd_name != "EOF":
             cmd_name = cmd_name.lower()
         return cmd_name, arg, line
 
