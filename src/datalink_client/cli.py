@@ -353,13 +353,15 @@ class DataLinkShell(cmd.Cmd):
         self._with_reconnect(run)
 
     def do_position(self, arg: str) -> None:
-        """POSITION SET <pktid> <time> | POSITION AFTER <time> - Set read position
+        """POSITION SET <pktid|EARLIEST|LATEST> [time] | POSITION AFTER <time>
 
         <time> can be epoch microseconds (int) or an ISO 8601 datetime string.
+        EARLIEST and LATEST do not require a time argument.
         """
         parts = arg.split()
         if len(parts) < 2:
-            print("Usage: POSITION SET <pktid> <time>  or  POSITION AFTER <time>")
+            print("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]")
+            print("       POSITION AFTER <time>")
             print("  <time> is epoch microseconds or an ISO 8601 datetime string")
             return
         subcmd = parts[0].upper()
@@ -369,15 +371,20 @@ class DataLinkShell(cmd.Cmd):
             except ValueError:
                 return value  # pass as string; client will convert
         def run() -> None:
-            if subcmd == "SET" and len(parts) >= 3:
-                pktid: str | int = parts[1]
-                if pktid not in ("EARLIEST", "LATEST"):
+            if subcmd == "SET":
+                pktid: str | int = parts[1].upper()
+                if pktid in ("EARLIEST", "LATEST"):
+                    uspkttime: int | str = _parse_time(parts[2]) if len(parts) >= 3 else 0
+                elif len(parts) >= 3:
                     try:
-                        pktid = int(pktid)
+                        pktid = int(parts[1])
                     except ValueError:
                         print(f"Invalid pktid: {parts[1]}")
                         return
-                uspkttime = _parse_time(parts[2])
+                    uspkttime = _parse_time(parts[2])
+                else:
+                    print("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]")
+                    return
                 resp = self.dl.position_set(pktid, uspkttime)
                 print(f"OK: position set to pktid={resp.value}")
             elif subcmd == "AFTER":
@@ -385,8 +392,8 @@ class DataLinkShell(cmd.Cmd):
                 resp = self.dl.position_after(ustime)
                 print(f"OK: position set to pktid={resp.value}")
             else:
-                print("Usage: POSITION SET <pktid> <time>  or  POSITION AFTER <time>")
-                print("  <time> is epoch microseconds or an ISO 8601 datetime string")
+                print("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]")
+                print("       POSITION AFTER <time>")
         self._with_reconnect(run)
 
     def complete_position(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
@@ -521,8 +528,10 @@ class DataLinkShell(cmd.Cmd):
             "  AUTH JWT <token>           - Authenticate with a JSON Web Token\n"
             "  MATCH <pattern>            - Set match expression (e.g. IU_ANMO.*)\n"
             "  REJECT <pattern>           - Set reject expression\n"
-            "  POSITION SET <pktid> <time> - Set read position (pktid: int, EARLIEST, LATEST)\n"
+            "  POSITION SET <pktid> <time> - Set read position (pktid: int or EARLIEST/LATEST)\n"
             "  POSITION AFTER <time>      - Set read position after time\n"
+            "  POSITION SET EARLIEST      - Set read position to earliest packet\n"
+            "  POSITION SET LATEST        - Set read position to latest packet\n"
             "  READ <pktid>               - Read a specific packet by ID\n"
             "  STREAM                     - Start streaming (Ctrl+C or Enter to stop)\n"
             "  STATUS [match]             - Print formatted server status\n"
