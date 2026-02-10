@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- Update license to Apache 2.
+
 ## 1.1.0
 
 - For `position_set()` and `position_after()` accept date-time strings and convert as needed.
