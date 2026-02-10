@@ -4,6 +4,7 @@
 
 - For `position_set()` and `position_after()` accept date-time strings and convert as needed.
 - CLI "POSITON SET" to accept "EARLIEST" and "LATEST" special values.
+- CLI "STREAM" accepts an optional -p to parse /MSEED and /MSEED3 packets if pymseed is available.
 - Add CLI command completion with tab.
 
 ## 1.0.0

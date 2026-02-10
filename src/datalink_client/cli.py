@@ -10,6 +10,12 @@ from .client import DataLink
 from .protocol import DataLinkError, DataLinkPacket
 from .time_utils import ustime_to_timestring
 
+try:
+    from pymseed import MS3Record
+    _has_pymseed = True
+except ImportError:
+    _has_pymseed = False
+
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -23,6 +29,12 @@ def _print_packet(pkt: DataLinkPacket) -> None:
         f"end={ustime_to_timestring(pkt.dataend)} "
         f"bytes={len(pkt.data)}"
     )
+
+
+def _print_mseed_detail(data: bytes) -> None:
+    """Parse miniSEED record(s) from data and print a summary line per record."""
+    for msr in MS3Record.from_buffer(data):
+        print(f"    {msr}")
 
 
 def _fmt(v: Any) -> str:
@@ -425,8 +437,13 @@ class DataLinkShell(cmd.Cmd):
         self._with_reconnect(run)
 
     def do_stream(self, arg: str) -> None:
-        """STREAM - Start streaming (Ctrl+C to stop)"""
+        """STREAM [-p] - Start streaming (-p: parse miniSEED detail, requires pymseed)"""
         import select
+
+        parse_detail = "-p" in arg.split()
+        if parse_detail and not _has_pymseed:
+            print("Error: pymseed package is required for -p flag (pip install pymseed)")
+            return
 
         try:
             self._ensure_connected()
@@ -447,7 +464,10 @@ class DataLinkShell(cmd.Cmd):
                     packet_type = header.split(None, 1)[0] if header else ""
                     if packet_type == "PACKET":
                         try:
-                            _print_packet(self.dl._parse_packet(header, data))
+                            pkt = self.dl._parse_packet(header, data)
+                            _print_packet(pkt)
+                            if parse_detail and pkt.streamid.endswith(("/MSEED", "/MSEED3")):
+                                _print_mseed_detail(pkt.data)
                         except DataLinkError:
                             pass
                     elif packet_type == "ENDSTREAM":
@@ -533,7 +553,7 @@ class DataLinkShell(cmd.Cmd):
             "  POSITION SET EARLIEST      - Set read position to earliest packet\n"
             "  POSITION SET LATEST        - Set read position to latest packet\n"
             "  READ <pktid>               - Read a specific packet by ID\n"
-            "  STREAM                     - Start streaming (Ctrl+C or Enter to stop)\n"
+            "  STREAM [-p]                - Start streaming (-p: parse miniSEED detail)\n"
             "  STATUS [match]             - Print formatted server status\n"
             "  STREAMS [match]            - Print formatted stream list\n"
             "  CONNECTIONS [match]        - Print formatted connection list\n"
