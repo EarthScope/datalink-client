@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- For `position_set()` and `position_after()` accept date-time strings and convert as needed.
+- Add CLI command completion with tab.
+
 ## 1.0.0
 
 - Initial release.

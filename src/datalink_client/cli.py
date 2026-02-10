@@ -38,9 +38,6 @@ def _print_info_status(info: dict[str, Any]) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"Current time: {now} UTC")
     print(f"Server ID: {_fmt(info.get('ServerID'))} ({_fmt(info.get('Version'))})")
-    cap = info.get("Capabilities")
-    if cap:
-        print(f"Capabilities: {cap}")
 
     status = info.get("Status") or {}
     if status:
@@ -263,6 +260,9 @@ class DataLinkShell(cmd.Cmd):
                     print(f"Reconnected to {self.dl._host}:{self.dl._port}{tls_label}")
                 func()
                 return
+            except ValueError as e:
+                print(f"Error: {e}")
+                return
             except DataLinkError as e:
                 msg = str(e)
                 if attempt == 0 and ("Connection closed" in msg or "Not connected" in msg):
@@ -353,12 +353,21 @@ class DataLinkShell(cmd.Cmd):
         self._with_reconnect(run)
 
     def do_position(self, arg: str) -> None:
-        """POSITION SET <pktid> <us> | POSITION AFTER <us> - Set read position"""
+        """POSITION SET <pktid> <time> | POSITION AFTER <time> - Set read position
+
+        <time> can be epoch microseconds (int) or an ISO 8601 datetime string.
+        """
         parts = arg.split()
         if len(parts) < 2:
-            print("Usage: POSITION SET <pktid> <uspkttime>  or  POSITION AFTER <ustime>")
+            print("Usage: POSITION SET <pktid> <time>  or  POSITION AFTER <time>")
+            print("  <time> is epoch microseconds or an ISO 8601 datetime string")
             return
         subcmd = parts[0].upper()
+        def _parse_time(value: str) -> int | str:
+            try:
+                return int(value)
+            except ValueError:
+                return value  # pass as string; client will convert
         def run() -> None:
             if subcmd == "SET" and len(parts) >= 3:
                 pktid: str | int = parts[1]
@@ -368,23 +377,16 @@ class DataLinkShell(cmd.Cmd):
                     except ValueError:
                         print(f"Invalid pktid: {parts[1]}")
                         return
-                try:
-                    uspkttime = int(parts[2])
-                except ValueError:
-                    print(f"Invalid uspkttime: {parts[2]}")
-                    return
+                uspkttime = _parse_time(parts[2])
                 resp = self.dl.position_set(pktid, uspkttime)
                 print(f"OK: position set to pktid={resp.value}")
             elif subcmd == "AFTER":
-                try:
-                    ustime = int(parts[1])
-                except ValueError:
-                    print(f"Invalid ustime: {parts[1]}")
-                    return
+                ustime = _parse_time(parts[1])
                 resp = self.dl.position_after(ustime)
                 print(f"OK: position set to pktid={resp.value}")
             else:
-                print("Usage: POSITION SET <pktid> <uspkttime>  or  POSITION AFTER <ustime>")
+                print("Usage: POSITION SET <pktid> <time>  or  POSITION AFTER <time>")
+                print("  <time> is epoch microseconds or an ISO 8601 datetime string")
         self._with_reconnect(run)
 
     def complete_position(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
@@ -519,16 +521,17 @@ class DataLinkShell(cmd.Cmd):
             "  AUTH JWT <token>           - Authenticate with a JSON Web Token\n"
             "  MATCH <pattern>            - Set match expression (e.g. IU_ANMO.*)\n"
             "  REJECT <pattern>           - Set reject expression\n"
-            "  POSITION SET <pktid> <us>  - Set read position (pktid: int, EARLIEST, LATEST)\n"
-            "  POSITION AFTER <us>        - Set read position after time (epoch microseconds)\n"
+            "  POSITION SET <pktid> <time> - Set read position (pktid: int, EARLIEST, LATEST)\n"
+            "  POSITION AFTER <time>      - Set read position after time\n"
             "  READ <pktid>               - Read a specific packet by ID\n"
-            "  STREAM                     - Start streaming (Ctrl+C to stop)\n"
+            "  STREAM                     - Start streaming (Ctrl+C or Enter to stop)\n"
             "  STATUS [match]             - Print formatted server status\n"
             "  STREAMS [match]            - Print formatted stream list\n"
             "  CONNECTIONS [match]        - Print formatted connection list\n"
             "  INFO <type> [match]        - Request info and print raw XML\n"
             "  QUIT / EXIT                - Disconnect and exit (or Ctrl+D or Ctrl+C)\n"
             "\n"
+            "  <time> is epoch microseconds or an ISO 8601 datetime string.\n"
             "  All commands are case-insensitive. Tab completion is supported.\n"
         )
 

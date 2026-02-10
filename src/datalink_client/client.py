@@ -22,6 +22,7 @@ from .protocol import (
     DataLinkResponse,
     typed_attrs,
 )
+from .time_utils import timestring_to_ustime
 
 logger = logging.getLogger(__name__)
 
@@ -371,12 +372,16 @@ class DataLink:
         header, data = self._recv_packet()
         return self._expect_ok(header, data)
 
-    def position_set(self, pktid: str | int, uspkttime: int) -> DataLinkResponse:
+    def position_set(self, pktid: str | int, uspkttime: int | str) -> DataLinkResponse:
+        if isinstance(uspkttime, str):
+            uspkttime = timestring_to_ustime(uspkttime)
         self._send_packet(f"POSITION SET {pktid} {uspkttime}")
         header, data = self._recv_packet()
         return self._expect_ok(header, data)
 
-    def position_after(self, ustime: int) -> DataLinkResponse:
+    def position_after(self, ustime: int | str) -> DataLinkResponse:
+        if isinstance(ustime, str):
+            ustime = timestring_to_ustime(ustime)
         self._send_packet(f"POSITION AFTER {ustime}")
         header, data = self._recv_packet()
         return self._expect_ok(header, data)
