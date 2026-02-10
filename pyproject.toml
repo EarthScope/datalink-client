@@ -7,14 +7,14 @@ name = "datalink-client"
 dynamic = ["version"]
 description = "DataLink protocol 1.1 client for reading and writing data using the DataLink protocol (e.g. EarthScope ringserver)."
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
 authors = []
 keywords = ["datalink", "seismology", "ringserver", "earthscope"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
