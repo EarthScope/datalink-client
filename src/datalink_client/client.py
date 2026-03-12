@@ -11,7 +11,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Generator
-from typing import Any, Literal, overload
+from typing import Any, Literal, Union, overload
 
 from .protocol import (
     DL_MAGIC,
@@ -23,6 +23,8 @@ from .protocol import (
     typed_attrs,
 )
 from .time_utils import timestring_to_ustime
+
+BufferLike = Union[bytes, bytearray, memoryview]
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +222,7 @@ class DataLink:
             received += len(chunk)
         return b"".join(buf)
 
-    def _send_packet(self, header: str, data: bytes | None = None) -> None:
+    def _send_packet(self, header: str, data: BufferLike | None = None) -> None:
         if self._sock is None:
             raise DataLinkError("Not connected")
         header_bytes = header.encode("ascii")
@@ -230,10 +232,9 @@ class DataLink:
             )
         preheader = DL_MAGIC + bytes([len(header_bytes)])
         try:
+            self._sock.sendall(preheader + header_bytes)
             if data is not None:
-                self._sock.sendall(preheader + header_bytes + data)
-            else:
-                self._sock.sendall(preheader + header_bytes)
+                self._sock.sendall(data)
         except OSError:
             self.close()
             raise
@@ -408,7 +409,7 @@ class DataLink:
         streamid: str,
         datastart: int,
         dataend: int,
-        data: bytes,
+        data: BufferLike,
         ack: Literal[True],
         pktid: int | None = ...,
     ) -> DataLinkResponse: ...
@@ -419,7 +420,7 @@ class DataLink:
         streamid: str,
         datastart: int,
         dataend: int,
-        data: bytes,
+        data: BufferLike,
         ack: Literal[False] = ...,
         pktid: int | None = ...,
     ) -> None: ...
@@ -429,7 +430,7 @@ class DataLink:
         streamid: str,
         datastart: int,
         dataend: int,
-        data: bytes,
+        data: BufferLike,
         ack: bool = False,
         pktid: int | None = None,
     ) -> DataLinkResponse | None:

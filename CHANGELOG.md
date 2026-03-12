@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.2
+
+- `write()` `data` parameter now accepts `bytes`, `bytearray`, or `memoryview`, avoiding a buffer copy for zero-copy writes.
+
 ## 1.1.1
 
 - Update license to Apache 2.
