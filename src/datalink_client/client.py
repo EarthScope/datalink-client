@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import platform
@@ -71,6 +72,8 @@ class DataLink:
         self._tls_noverify = tls_noverify
         self._sock: socket.socket | None = None
         self._streaming = False
+        self._use_sendmsg = False
+        self._write_buf: bytearray | None = None
         self.server_id: str | None = None
         self.server_capabilities: dict[str, str | bool] = {}
 
@@ -152,6 +155,7 @@ class DataLink:
                         context.verify_mode = ssl.CERT_NONE
                     sock = context.wrap_socket(sock, server_hostname=self._host)
                 self._sock = sock
+                self._use_sendmsg = not self._tls
                 break
             except ssl.SSLCertVerificationError as e:
                 sock.close()
@@ -183,11 +187,47 @@ class DataLink:
                 finally:
                     self._sock = None
         self._streaming = False
+        self._use_sendmsg = False
+        self._write_buf = None
 
     def reconnect(self) -> None:
         """Close the current connection (if any) and open a fresh one."""
         self.close()
         self.connect()
+
+    def begin_batch(self) -> None:
+        """Enable write buffering. Packets are queued until :meth:`flush` is called."""
+        self._write_buf = bytearray()
+
+    def flush(self) -> None:
+        """Send all buffered packets and disable buffering."""
+        if self._write_buf is None:
+            return
+        buf = self._write_buf
+        self._write_buf = None
+        if buf and self._sock is not None:
+            try:
+                self._sock.sendall(buf)
+            except OSError:
+                self.close()
+                raise
+
+    @contextlib.contextmanager
+    def batch(self):
+        """Context manager for batched writes.
+
+        Usage::
+
+            with dl.batch():
+                for record in records:
+                    dl.write(streamid, start, end, record)
+            # flush() is called automatically on exit
+        """
+        self.begin_batch()
+        try:
+            yield
+        finally:
+            self.flush()
 
     def __enter__(self) -> DataLink:
         self.connect()
@@ -235,14 +275,25 @@ class DataLink:
         frame[0:2] = DL_MAGIC
         frame[2] = hlen
         frame[3:] = header_bytes
+        if self._write_buf is not None:
+            self._write_buf.extend(frame)
+            if data is not None:
+                self._write_buf.extend(data)
+            return
         try:
-            if data is None:
-                self._sock.sendall(frame)
-            elif isinstance(data, memoryview):
-                self._sock.sendall(frame)
-                self._sock.sendall(data)
+            if self._use_sendmsg:
+                if data is None:
+                    self._sock.sendmsg([frame])
+                else:
+                    self._sock.sendmsg([frame, data])
             else:
-                self._sock.sendall(frame + data)
+                if data is None:
+                    self._sock.sendall(frame)
+                elif isinstance(data, memoryview):
+                    self._sock.sendall(frame)
+                    self._sock.sendall(data)
+                else:
+                    self._sock.sendall(frame + data)
         except OSError:
             self.close()
             raise
@@ -442,6 +493,8 @@ class DataLink:
         ack: bool = False,
         pktid: int | None = None,
     ) -> DataLinkResponse | None:
+        if ack and self._write_buf is not None:
+            self.flush()
         flags = ("I" if pktid is not None else "") + ("A" if ack else "N")
         size = len(data)
         header = f"WRITE {streamid} {datastart} {dataend} {flags} {size}"

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.0
+
+- Add a `batch()` context manager for coalescing many no-ack writes into a single send.
+- Sending uses scatter-gather on plain (non-TLS) sockets, eliminating the payload copy per write.
+
 ## 1.2.0
 
 - `write()` `data` parameter now accepts `bytes`, `bytearray`, or `memoryview`, avoiding a buffer copy for zero-copy writes.
