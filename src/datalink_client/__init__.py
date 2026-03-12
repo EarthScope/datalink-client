@@ -25,7 +25,7 @@ from .cli import main
 from .protocol import DataLinkError, DataLinkPacket, DataLinkResponse
 from .time_utils import timestring_to_ustime, ustime_to_timestring
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __all__ = [
     "DataLink",
     "DataLinkError",

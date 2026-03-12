@@ -1,8 +1,10 @@
 # Changelog
 
-## 1.1.2
+## 1.2.0
 
 - `write()` `data` parameter now accepts `bytes`, `bytearray`, or `memoryview`, avoiding a buffer copy for zero-copy writes.
+- CLI `WRITE <streamID> <text> [pktID]` command to write a plain text packet.
+- CLI `WRITEMSEED2 <sourceID> <text> [pktID]` and `WRITEMSEED3 <sourceID> <text> [pktID]` commands to write text wrapped in a miniSEED v2 or v3 record (requires pymseed).
 
 ## 1.1.1
 

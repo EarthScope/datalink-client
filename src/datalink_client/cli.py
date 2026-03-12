@@ -11,7 +11,7 @@ from .protocol import DataLinkError, DataLinkPacket
 from .time_utils import ustime_to_timestring
 
 try:
-    from pymseed import MS3Record
+    from pymseed import MS3Record, DataEncoding
     _has_pymseed = True
 except ImportError:
     _has_pymseed = False
@@ -226,6 +226,29 @@ def _print_info_connections(info: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Write argument parser
+# ---------------------------------------------------------------------------
+
+def _parse_write_args(arg: str) -> tuple[str, str, int | None] | None:
+    """Parse '<streamID> <textpayload> [packetID]' into (streamid, text, pktid)."""
+    parts = arg.split(None, 2)
+    if len(parts) < 2:
+        return None
+    streamid = parts[0]
+    rest = parts[1] if len(parts) == 2 else parts[2]
+    rest_parts = rest.rsplit(None, 1)
+    pktid: int | None = None
+    text = rest
+    if len(rest_parts) == 2:
+        try:
+            pktid = int(rest_parts[1])
+            text = rest_parts[0]
+        except ValueError:
+            pass
+    return streamid, text, pktid
+
+
+# ---------------------------------------------------------------------------
 # Auth credentials for reconnect
 # ---------------------------------------------------------------------------
 
@@ -436,6 +459,57 @@ class DataLinkShell(cmd.Cmd):
             _print_packet(pkt)
         self._with_reconnect(run)
 
+    def do_write(self, arg: str) -> None:
+        """WRITE <streamID> <textpayload> [packetID] - Write a text packet"""
+        parsed = _parse_write_args(arg)
+        if not parsed:
+            print("Usage: WRITE <streamID> <textpayload> [packetID]")
+            return
+        streamid, text, pktid = parsed
+        def run() -> None:
+            import time
+            now = int(time.time() * 1_000_000)
+            data = text.encode("utf-8")
+            resp = self.dl.write(streamid, now, now, data, ack=True, pktid=pktid)
+            print(f"OK: pktid={resp.value}")
+        self._with_reconnect(run)
+
+    def _do_writemseed(self, arg: str, format_version: int) -> None:
+        if not _has_pymseed:
+            print("Error: pymseed package is required (pip install pymseed)")
+            return
+        parsed = _parse_write_args(arg)
+        if not parsed:
+            print(f"Usage: WRITEMSEED{format_version} <sourceID> <textpayload> [packetID]")
+            return
+        sourceid, text, pktid = parsed
+        suffix = "/MSEED" if format_version == 2 else "/MSEED3"
+        has_suffix = sourceid.endswith("/MSEED") or sourceid.endswith("/MSEED3")
+        dl_streamid = sourceid if has_suffix else sourceid + suffix
+        def run() -> None:
+            import time
+            now_ns = time.time_ns()
+            now_us = now_ns // 1000
+            msr = MS3Record()
+            msr.sourceid = sourceid
+            msr.starttime = now_ns
+            msr.samprate = 0
+            msr.reclen = 512
+            msr.encoding = DataEncoding.TEXT
+            msr.formatversion = format_version
+            mseed_bytes = b"".join(msr.generate(data_samples=text, sample_type='t'))
+            resp = self.dl.write(dl_streamid, now_us, now_us, mseed_bytes, ack=True, pktid=pktid)
+            print(f"OK: pktid={resp.value}")
+        self._with_reconnect(run)
+
+    def do_writemseed2(self, arg: str) -> None:
+        """WRITEMSEED2 <sourceID> <textpayload> [packetID] - Write text as miniSEED v2"""
+        self._do_writemseed(arg, format_version=2)
+
+    def do_writemseed3(self, arg: str) -> None:
+        """WRITEMSEED3 <sourceID> <textpayload> [packetID] - Write text as miniSEED v3"""
+        self._do_writemseed(arg, format_version=3)
+
     def do_stream(self, arg: str) -> None:
         """STREAM [-p] - Start streaming (-p: parse miniSEED detail, requires pymseed)"""
         import select
@@ -553,6 +627,9 @@ class DataLinkShell(cmd.Cmd):
             "  POSITION SET EARLIEST      - Set read position to earliest packet\n"
             "  POSITION SET LATEST        - Set read position to latest packet\n"
             "  READ <pktid>               - Read a specific packet by ID\n"
+            "  WRITE <streamID> <text> [pktID]        - Write a text packet\n"
+            "  WRITEMSEED2 <streamID> <text> [pktID]  - Write text as miniSEED v2 (requires pymseed)\n"
+            "  WRITEMSEED3 <streamID> <text> [pktID]  - Write text as miniSEED v3 (requires pymseed)\n"
             "  STREAM [-p]                - Start streaming (-p: parse miniSEED detail)\n"
             "  STATUS [match]             - Print formatted server status\n"
             "  STREAMS [match]            - Print formatted stream list\n"

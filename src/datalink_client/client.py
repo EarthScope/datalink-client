@@ -226,15 +226,23 @@ class DataLink:
         if self._sock is None:
             raise DataLinkError("Not connected")
         header_bytes = header.encode("ascii")
-        if len(header_bytes) > MAX_HEADER_LEN:
+        hlen = len(header_bytes)
+        if hlen > MAX_HEADER_LEN:
             raise DataLinkError(
-                f"Header length {len(header_bytes)} exceeds {MAX_HEADER_LEN}"
+                f"Header length {hlen} exceeds {MAX_HEADER_LEN}"
             )
-        preheader = DL_MAGIC + bytes([len(header_bytes)])
+        frame = bytearray(3 + hlen)
+        frame[0:2] = DL_MAGIC
+        frame[2] = hlen
+        frame[3:] = header_bytes
         try:
-            self._sock.sendall(preheader + header_bytes)
-            if data is not None:
+            if data is None:
+                self._sock.sendall(frame)
+            elif isinstance(data, memoryview):
+                self._sock.sendall(frame)
                 self._sock.sendall(data)
+            else:
+                self._sock.sendall(frame + data)
         except OSError:
             self.close()
             raise
@@ -434,10 +442,7 @@ class DataLink:
         ack: bool = False,
         pktid: int | None = None,
     ) -> DataLinkResponse | None:
-        flags = ""
-        if pktid is not None:
-            flags += "I"
-        flags += "A" if ack else "N"
+        flags = ("I" if pktid is not None else "") + ("A" if ack else "N")
         size = len(data)
         header = f"WRITE {streamid} {datastart} {dataend} {flags} {size}"
         if pktid is not None:
