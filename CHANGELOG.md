@@ -1,5 +1,9 @@
 # Changelog
 
+## unreleased
+
+- Wrap socket-level `OSError` in `_send_packet`, `flush`, and `_recv_all` and re-raise as `DataLinkError` so callers can handle all transport failures with a single exception type.
+
 ## 1.3.0
 
 - Add a `batch()` context manager for coalescing many no-ack writes into a single send.

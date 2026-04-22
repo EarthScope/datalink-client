@@ -208,9 +208,9 @@ class DataLink:
         if buf and self._sock is not None:
             try:
                 self._sock.sendall(buf)
-            except OSError:
+            except OSError as e:
                 self.close()
-                raise
+                raise DataLinkError(f"flush failed: {e}") from e
 
     @contextlib.contextmanager
     def batch(self):
@@ -252,9 +252,9 @@ class DataLink:
                         "connection closed"
                     )
                 raise
-            except OSError:
+            except OSError as e:
                 self.close()
-                raise
+                raise DataLinkError(f"recv failed: {e}") from e
             if not chunk:
                 self.close()
                 raise DataLinkError("Connection closed")
@@ -294,9 +294,9 @@ class DataLink:
                     self._sock.sendall(data)
                 else:
                     self._sock.sendall(frame + data)
-        except OSError:
+        except OSError as e:
             self.close()
-            raise
+            raise DataLinkError(f"send failed: {e}") from e
 
     def _recv_packet(self) -> tuple[str, bytes | None]:
         if self._sock is None:
