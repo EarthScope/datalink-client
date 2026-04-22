@@ -10,6 +10,7 @@ import socket
 import ssl
 import sys
 import time
+import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Generator
 from typing import Any, Literal, Union, overload
@@ -434,21 +435,51 @@ class DataLink:
 
     def position_set(self, pktid: str | int, uspkttime: int | str) -> DataLinkResponse:
         if isinstance(uspkttime, str):
-            uspkttime = timestring_to_ustime(uspkttime)
+            try:
+                uspkttime = timestring_to_ustime(uspkttime)
+            except ValueError as e:
+                raise DataLinkError(f"Invalid time string {uspkttime!r}: {e}") from e
         self._send_packet(f"POSITION SET {pktid} {uspkttime}")
         header, data = self._recv_packet()
         return self._expect_ok(header, data)
 
     def position_after(self, ustime: int | str) -> DataLinkResponse:
         if isinstance(ustime, str):
-            ustime = timestring_to_ustime(ustime)
+            try:
+                ustime = timestring_to_ustime(ustime)
+            except ValueError as e:
+                raise DataLinkError(f"Invalid time string {ustime!r}: {e}") from e
         self._send_packet(f"POSITION AFTER {ustime}")
         header, data = self._recv_packet()
         return self._expect_ok(header, data)
 
-    def last_pktid(self) -> int:
+    def set_position_latest(self) -> int:
+        """Set the read position to the latest packet and return its ID.
+
+        Calls ``POSITION SET LATEST 0`` on the server and returns the resulting
+        packet ID.  Use this before calling :meth:`stream` when you only want
+        packets that arrive after this call.
+
+        Returns:
+            The current latest packet ID.
+        """
         resp = self.position_set("LATEST", 0)
         return resp.value
+
+    def last_pktid(self) -> int:
+        """Deprecated alias for :meth:`set_position_latest`.
+
+        .. deprecated::
+            Renamed to ``set_position_latest()`` to make the side effect
+            explicit.  ``last_pktid()`` will be removed in a future release.
+        """
+        warnings.warn(
+            "last_pktid() is deprecated and will be removed in a future release; "
+            "use set_position_latest() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.set_position_latest()
 
     def match(self, pattern: str) -> DataLinkResponse:
         payload = pattern.encode("utf-8")
@@ -570,7 +601,10 @@ class DataLink:
 
     @staticmethod
     def _parse_info_xml(xml_string: str) -> dict[str, Any]:
-        root = ET.fromstring(xml_string)
+        try:
+            root = ET.fromstring(xml_string)
+        except ET.ParseError as e:
+            raise DataLinkError(f"Malformed INFO XML from server: {e}") from e
         result = typed_attrs(root)
         status_el = root.find("Status")
         if status_el is not None:
