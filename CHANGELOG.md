@@ -1,11 +1,12 @@
 # Changelog
 
-## unreleased
+## 1.3.1
 
 - Wrap socket-level `OSError` in `_send_packet`, `flush`, and `_recv_all` and re-raise as `DataLinkError` so callers can handle all transport failures with a single exception type.
 - Wrap other exceptions so callers only need to handle a single exception type for API-level failures.
-- Switched to recv_into with a pre-allocated bytearray(n)
+- Switched to recv_into with a pre-allocated bytearray(n).
 - Rename `DataLink.last_pktid()` to `set_position_latest()` for clarity.
+- Add a test suite.
 
 ## 1.3.0
 

@@ -25,8 +25,14 @@ classifiers = [
     "Topic :: Scientific/Engineering",
 ]
 
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
 [project.scripts]
 datalink-client = "datalink_client:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.hatch.version]
 path = "src/datalink_client/__init__.py"
