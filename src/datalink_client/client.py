@@ -240,11 +240,11 @@ class DataLink:
     def _recv_all(self, n: int) -> bytes:
         if self._sock is None:
             raise DataLinkError("Not connected")
-        buf = []
+        buf = bytearray(n)
         received = 0
         while received < n:
             try:
-                chunk = self._sock.recv(n - received)
+                chunk = self._sock.recv_into(memoryview(buf)[received:])
             except socket.timeout:
                 if received > 0:
                     self.close()
@@ -259,9 +259,8 @@ class DataLink:
             if not chunk:
                 self.close()
                 raise DataLinkError("Connection closed")
-            buf.append(chunk)
-            received += len(chunk)
-        return b"".join(buf)
+            received += chunk
+        return bytes(buf)
 
     def _send_packet(self, header: str, data: BufferLike | None = None) -> None:
         if self._sock is None:
