@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.2
+
+- `position_set()` `uspkttime` is now optional; when omitted the time field is not sent on the wire.
+- CLI `POSITION SET <pktid> [time]`: time argument is now optional for numeric packet IDs.
+
 ## 1.3.1
 
 - Wrap socket-level `OSError` in `_send_packet`, `flush`, and `_recv_all` and re-raise as `DataLinkError` so callers can handle all transport failures with a single exception type.

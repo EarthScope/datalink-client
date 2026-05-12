@@ -408,19 +408,16 @@ class DataLinkShell(cmd.Cmd):
         def run() -> None:
             if subcmd == "SET":
                 pktid: str | int = parts[1].upper()
-                if pktid in ("EARLIEST", "LATEST"):
-                    uspkttime: int | str = _parse_time(parts[2]) if len(parts) >= 3 else 0
-                elif len(parts) >= 3:
+                if pktid not in ("EARLIEST", "LATEST"):
                     try:
                         pktid = int(parts[1])
                     except ValueError:
                         print(f"Invalid pktid: {parts[1]}")
                         return
-                    uspkttime = _parse_time(parts[2])
+                if len(parts) >= 3:
+                    resp = self.dl.position_set(pktid, _parse_time(parts[2]))
                 else:
-                    print("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]")
-                    return
-                resp = self.dl.position_set(pktid, uspkttime)
+                    resp = self.dl.position_set(pktid)
                 print(f"OK: position set to pktid={resp.value}")
             elif subcmd == "AFTER":
                 ustime = _parse_time(parts[1])
@@ -622,7 +619,7 @@ class DataLinkShell(cmd.Cmd):
             "  AUTH JWT <token>           - Authenticate with a JSON Web Token\n"
             "  MATCH <pattern>            - Set match expression (e.g. IU_ANMO.*)\n"
             "  REJECT <pattern>           - Set reject expression\n"
-            "  POSITION SET <pktid> <time> - Set read position (pktid: int or EARLIEST/LATEST)\n"
+            "  POSITION SET <pktid> [time] - Set read position (pktid: int or EARLIEST/LATEST)\n"
             "  POSITION AFTER <time>      - Set read position after time\n"
             "  POSITION SET EARLIEST      - Set read position to earliest packet\n"
             "  POSITION SET LATEST        - Set read position to latest packet\n"

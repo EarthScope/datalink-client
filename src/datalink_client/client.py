@@ -30,6 +30,8 @@ BufferLike = Union[bytes, bytearray, memoryview]
 
 logger = logging.getLogger(__name__)
 
+TIME_UNSET_VALUE: int = -(2**63)
+
 
 class DataLink:
     """DataLink protocol 1.1 client for query and streaming modes.
@@ -432,13 +434,20 @@ class DataLink:
         header, data = self._recv_packet()
         return self._expect_ok(header, data)
 
-    def position_set(self, pktid: str | int, uspkttime: int | str) -> DataLinkResponse:
+    def position_set(
+        self,
+        pktid: str | int,
+        uspkttime: int | str = TIME_UNSET_VALUE,
+    ) -> DataLinkResponse:
         if isinstance(uspkttime, str):
             try:
                 uspkttime = timestring_to_ustime(uspkttime)
             except ValueError as e:
                 raise DataLinkError(f"Invalid time string {uspkttime!r}: {e}") from e
-        self._send_packet(f"POSITION SET {pktid} {uspkttime}")
+        if uspkttime == TIME_UNSET_VALUE:
+            self._send_packet(f"POSITION SET {pktid}")
+        else:
+            self._send_packet(f"POSITION SET {pktid} {uspkttime}")
         header, data = self._recv_packet()
         return self._expect_ok(header, data)
 
@@ -455,14 +464,14 @@ class DataLink:
     def set_position_latest(self) -> int:
         """Set the read position to the latest packet and return its ID.
 
-        Calls ``POSITION SET LATEST 0`` on the server and returns the resulting
+        Calls ``POSITION SET LATEST`` on the server and returns the resulting
         packet ID.  Use this before calling :meth:`stream` when you only want
         packets that arrive after this call.
 
         Returns:
             The current latest packet ID.
         """
-        resp = self.position_set("LATEST", 0)
+        resp = self.position_set("LATEST")
         return resp.value
 
     def last_pktid(self) -> int:
