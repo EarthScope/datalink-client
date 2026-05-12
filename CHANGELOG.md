@@ -1,9 +1,17 @@
 # Changelog
 
-## 1.3.2
+## 1.4.0
 
+- Add `DataLink.bye()` to send the BYE command; CLI `BYE` command sends it and exits.
+- Faster CLI streaming: a persistent 64 KiB recv buffer coalesces the per-packet 3-syscall read path into fewer, larger reads and eliminates per-call `bytearray` allocations.
+- Faster `ustime_to_timestring` via `time.gmtime` + direct f-string, eliminating `datetime`/`timedelta` object creation and `strftime` overhead.
 - `position_set()` `uspkttime` is now optional; when omitted the time field is not sent on the wire.
 - CLI `POSITION SET <pktid> [time]`: time argument is now optional for numeric packet IDs.
+- CLI: `-c "<command>"` (repeatable) runs one-shot commands without entering the REPL.
+- CLI: `-f <file>` reads commands from a script file (`#` comments and blank lines ignored).
+- CLI: when no `-c`/`-f` flags are given and stdin is not a TTY, piped stdin is treated as a script.
+- CLI: `-i`/`--interactive` drops into the REPL after non-interactive commands complete successfully.
+- CLI: non-interactive mode is fail-fast — the first failing command stops execution and produces a non-zero exit code; interactive mode is unchanged (errors print but do not exit).
 
 ## 1.3.1
 

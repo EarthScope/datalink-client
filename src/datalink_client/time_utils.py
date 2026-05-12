@@ -1,7 +1,8 @@
 """Epoch microsecond time conversion utilities."""
 
 import re
-from datetime import datetime, timezone, timedelta
+import time as _time
+from datetime import datetime, timezone
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -17,10 +18,12 @@ def ustime_to_timestring(ustime: int) -> str:
     Returns:
         String in ``YYYY-MM-DDThh:mm:ss.ssssssZ`` format.
     """
-    sec = ustime // 1_000_000
-    frac = ustime % 1_000_000
-    dt = _EPOCH + timedelta(seconds=sec, microseconds=frac)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S") + f".{dt.microsecond:06d}Z"
+    sec, frac = divmod(ustime, 1_000_000)
+    t = _time.gmtime(sec)
+    return (
+        f"{t.tm_year:04d}-{t.tm_mon:02d}-{t.tm_mday:02d}T"
+        f"{t.tm_hour:02d}:{t.tm_min:02d}:{t.tm_sec:02d}.{frac:06d}Z"
+    )
 
 
 def _normalize_timestring(timestring: str) -> str:

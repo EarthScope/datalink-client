@@ -77,6 +77,10 @@ class DataLink:
         self._streaming = False
         self._use_sendmsg = False
         self._write_buf: bytearray | None = None
+        self._recv_buf = bytearray(65536)
+        self._recv_view = memoryview(self._recv_buf)
+        self._recv_start = 0
+        self._recv_end = 0
         self.server_id: str | None = None
         self.server_capabilities: dict[str, str | bool] = {}
 
@@ -159,6 +163,8 @@ class DataLink:
                     sock = context.wrap_socket(sock, server_hostname=self._host)
                 self._sock = sock
                 self._use_sendmsg = not self._tls
+                self._recv_start = 0
+                self._recv_end = 0
                 break
             except ssl.SSLCertVerificationError as e:
                 sock.close()
@@ -192,6 +198,8 @@ class DataLink:
         self._streaming = False
         self._use_sendmsg = False
         self._write_buf = None
+        self._recv_start = 0
+        self._recv_end = 0
 
     def reconnect(self) -> None:
         """Close the current connection (if any) and open a fresh one."""
@@ -242,16 +250,41 @@ class DataLink:
     def _recv_all(self, n: int) -> bytes:
         if self._sock is None:
             raise DataLinkError("Not connected")
-        buf = bytearray(n)
-        received = 0
-        while received < n:
+
+        # Fast path: buffer already holds enough data.
+        available = self._recv_end - self._recv_start
+        if available >= n:
+            data = bytes(self._recv_view[self._recv_start:self._recv_start + n])
+            self._recv_start += n
+            return data
+
+        # Grow the persistent buffer if n exceeds its capacity (rare for large payloads).
+        if n > len(self._recv_buf):
+            new_size = max(n, len(self._recv_buf) * 2)
+            new_buf = bytearray(new_size)
+            if available > 0:
+                new_buf[:available] = self._recv_buf[self._recv_start:self._recv_end]
+            self._recv_buf = new_buf
+            self._recv_view = memoryview(self._recv_buf)
+            self._recv_start = 0
+            self._recv_end = available
+        elif len(self._recv_buf) - self._recv_start < n:
+            # Available bytes plus remaining tail room are not enough for n; compact to front.
+            if available > 0:
+                self._recv_buf[:available] = self._recv_buf[self._recv_start:self._recv_end]
+            self._recv_start = 0
+            self._recv_end = available
+
+        # Fill from the socket until we have n bytes.
+        while self._recv_end - self._recv_start < n:
             try:
-                chunk = self._sock.recv_into(memoryview(buf)[received:])
+                chunk = self._sock.recv_into(self._recv_view[self._recv_end:])
             except socket.timeout:
-                if received > 0:
+                partial = self._recv_end - self._recv_start
+                if partial > 0:
                     self.close()
                     raise DataLinkError(
-                        f"Timeout after partial read ({received}/{n} bytes); "
+                        f"Timeout after partial read ({partial}/{n} bytes); "
                         "connection closed"
                     )
                 raise
@@ -261,8 +294,11 @@ class DataLink:
             if not chunk:
                 self.close()
                 raise DataLinkError("Connection closed")
-            received += chunk
-        return bytes(buf)
+            self._recv_end += chunk
+
+        data = bytes(self._recv_view[self._recv_start:self._recv_start + n])
+        self._recv_start += n
+        return data
 
     def _send_packet(self, header: str, data: BufferLike | None = None) -> None:
         if self._sock is None:
@@ -372,10 +408,10 @@ class DataLink:
             pkttime = int(tokens[3])
             datastart = int(tokens[4])
             dataend = int(tokens[5])
-            size = int(tokens[6])
+            int(tokens[6])  # validate data_size field is numeric
         except (ValueError, IndexError) as e:
             raise DataLinkError(f"Invalid PACKET header: {e}") from e
-        payload = data[:size] if data is not None else b""
+        payload = data if data is not None else b""
         return DataLinkPacket(
             streamid=streamid,
             pktid=pktid,
@@ -554,6 +590,10 @@ class DataLink:
         if not header.startswith("PACKET "):
             raise DataLinkError(f"Expected PACKET reply, got: {header[:50]}")
         return self._parse_packet(header, data)
+
+    def bye(self) -> None:
+        """Send a BYE command to gracefully notify the server before disconnecting."""
+        self._send_packet("BYE")
 
     def stream(self) -> None:
         self._send_packet("STREAM")

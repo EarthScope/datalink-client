@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import cmd
 import sys
-from typing import Any
+from typing import Any, Iterable
 
 from .client import DataLink
 from .protocol import DataLinkError, DataLinkPacket
@@ -226,6 +226,59 @@ def _print_info_connections(info: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Time / position argument helpers
+# ---------------------------------------------------------------------------
+
+def _parse_time(value: str) -> int | str:
+    """Return value as int if it looks like an integer, otherwise as a string.
+
+    When a string is returned the client library will convert it via
+    timestring_to_ustime.
+    """
+    try:
+        return int(value)
+    except ValueError:
+        return value  # pass as string; client will convert
+
+
+def _parse_set_position_value(value: str) -> tuple[str | int, int | str | None]:
+    """Parse '<pktid> [time]' into (pktid, time_or_None).
+
+    pktid may be an integer or the keywords EARLIEST / LATEST.
+    time is optional; when absent None is returned so the caller can omit it
+    from the position_set call entirely (no time sent on the wire).
+    """
+    parts = value.split(None, 1)
+    if not parts:
+        raise ValueError("missing pktid")
+    head = parts[0].upper()
+    if head in ("EARLIEST", "LATEST"):
+        pktid: str | int = head
+    else:
+        try:
+            pktid = int(parts[0])
+        except ValueError as e:
+            raise ValueError(f"invalid pktid {parts[0]!r}") from e
+    t = _parse_time(parts[1]) if len(parts) == 2 else None
+    return pktid, t
+
+
+def _filter_script_lines(lines: Iterable[str]) -> list[str]:
+    """Strip line endings, drop blank lines and '#' comments.
+
+    Used for -f script files and piped stdin; -c values are taken verbatim.
+    """
+    out = []
+    for raw in lines:
+        line = raw.rstrip("\r\n")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Write argument parser
 # ---------------------------------------------------------------------------
 
@@ -270,6 +323,12 @@ class DataLinkShell(cmd.Cmd):
         super().__init__()
         self.dl = dl
         self.auth = auth
+        self.had_error: bool = False
+
+    def _fail(self, msg: str) -> None:
+        """Print msg and set had_error. Used to signal failure to non-interactive callers."""
+        print(msg)
+        self.had_error = True
 
     # -- Connection management ---------------------------------------------
 
@@ -296,7 +355,7 @@ class DataLinkShell(cmd.Cmd):
                 func()
                 return
             except ValueError as e:
-                print(f"Error: {e}")
+                self._fail(f"Error: {e}")
                 return
             except DataLinkError as e:
                 msg = str(e)
@@ -308,7 +367,7 @@ class DataLinkShell(cmd.Cmd):
                             continue
                     except DataLinkError:
                         pass
-                print(f"Error: {e}")
+                self._fail(f"Error: {e}")
                 return
 
     # -- Case-insensitive command dispatch ---------------------------------
@@ -325,7 +384,7 @@ class DataLinkShell(cmd.Cmd):
         return False
 
     def default(self, line: str) -> None:
-        print(f"Unknown command: {line.split()[0]}  (type HELP for commands)")
+        self._fail(f"Unknown command: {line.split()[0]}  (type HELP for commands)")
 
     # -- Commands ----------------------------------------------------------
 
@@ -343,24 +402,24 @@ class DataLinkShell(cmd.Cmd):
         """AUTH USERPASS <user> <pass> | AUTH JWT <token> - Authenticate"""
         parts = arg.split()
         if len(parts) < 1:
-            print("Usage: AUTH USERPASS <user> <pass>  or  AUTH JWT <token>")
+            self._fail("Usage: AUTH USERPASS <user> <pass>  or  AUTH JWT <token>")
             return
         subcmd = parts[0].upper()
         def run() -> None:
             if subcmd == "USERPASS":
                 if len(parts) < 3:
-                    print("Usage: AUTH USERPASS <username> <password>")
+                    self._fail("Usage: AUTH USERPASS <username> <password>")
                     return
                 resp = self.dl.auth_userpass(parts[1], parts[2])
                 print(f"OK: authenticated as {parts[1]}" if resp else f"ERROR: {resp.message}")
             elif subcmd == "JWT":
                 if len(parts) < 2:
-                    print("Usage: AUTH JWT <token>")
+                    self._fail("Usage: AUTH JWT <token>")
                     return
                 resp = self.dl.auth_jwt(parts[1])
                 print("OK: authenticated with JWT" if resp else f"ERROR: {resp.message}")
             else:
-                print("Usage: AUTH USERPASS <user> <pass>  or  AUTH JWT <token>")
+                self._fail("Usage: AUTH USERPASS <user> <pass>  or  AUTH JWT <token>")
         self._with_reconnect(run)
 
     def complete_auth(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
@@ -370,7 +429,7 @@ class DataLinkShell(cmd.Cmd):
     def do_match(self, arg: str) -> None:
         """MATCH <pattern> - Set match expression"""
         if not arg.strip():
-            print("Usage: MATCH <pattern>")
+            self._fail("Usage: MATCH <pattern>")
             return
         def run() -> None:
             resp = self.dl.match(arg.strip())
@@ -380,7 +439,7 @@ class DataLinkShell(cmd.Cmd):
     def do_reject(self, arg: str) -> None:
         """REJECT <pattern> - Set reject expression"""
         if not arg.strip():
-            print("Usage: REJECT <pattern>")
+            self._fail("Usage: REJECT <pattern>")
             return
         def run() -> None:
             resp = self.dl.reject(arg.strip())
@@ -395,16 +454,11 @@ class DataLinkShell(cmd.Cmd):
         """
         parts = arg.split()
         if len(parts) < 2:
-            print("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]")
-            print("       POSITION AFTER <time>")
-            print("  <time> is epoch microseconds or an ISO 8601 datetime string")
+            self._fail("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]\n"
+                       "       POSITION AFTER <time>\n"
+                       "  <time> is epoch microseconds or an ISO 8601 datetime string")
             return
         subcmd = parts[0].upper()
-        def _parse_time(value: str) -> int | str:
-            try:
-                return int(value)
-            except ValueError:
-                return value  # pass as string; client will convert
         def run() -> None:
             if subcmd == "SET":
                 pktid: str | int = parts[1].upper()
@@ -412,7 +466,7 @@ class DataLinkShell(cmd.Cmd):
                     try:
                         pktid = int(parts[1])
                     except ValueError:
-                        print(f"Invalid pktid: {parts[1]}")
+                        self._fail(f"Invalid pktid: {parts[1]}")
                         return
                 if len(parts) >= 3:
                     resp = self.dl.position_set(pktid, _parse_time(parts[2]))
@@ -424,8 +478,8 @@ class DataLinkShell(cmd.Cmd):
                 resp = self.dl.position_after(ustime)
                 print(f"OK: position set to pktid={resp.value}")
             else:
-                print("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]")
-                print("       POSITION AFTER <time>")
+                self._fail("Usage: POSITION SET <pktid|EARLIEST|LATEST> [time]\n"
+                           "       POSITION AFTER <time>")
         self._with_reconnect(run)
 
     def complete_position(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
@@ -444,12 +498,12 @@ class DataLinkShell(cmd.Cmd):
     def do_read(self, arg: str) -> None:
         """READ <pktid> - Read a specific packet by ID"""
         if not arg.strip():
-            print("Usage: READ <pktid>")
+            self._fail("Usage: READ <pktid>")
             return
         try:
             pkt_id = int(arg.strip())
         except ValueError:
-            print(f"Error: invalid pktid {arg.strip()}")
+            self._fail(f"Error: invalid pktid {arg.strip()}")
             return
         def run() -> None:
             pkt = self.dl.read(pkt_id)
@@ -460,7 +514,7 @@ class DataLinkShell(cmd.Cmd):
         """WRITE <streamID> <textpayload> [packetID] - Write a text packet"""
         parsed = _parse_write_args(arg)
         if not parsed:
-            print("Usage: WRITE <streamID> <textpayload> [packetID]")
+            self._fail("Usage: WRITE <streamID> <textpayload> [packetID]")
             return
         streamid, text, pktid = parsed
         def run() -> None:
@@ -473,11 +527,11 @@ class DataLinkShell(cmd.Cmd):
 
     def _do_writemseed(self, arg: str, format_version: int) -> None:
         if not _has_pymseed:
-            print("Error: pymseed package is required (pip install pymseed)")
+            self._fail("Error: pymseed package is required (pip install pymseed)")
             return
         parsed = _parse_write_args(arg)
         if not parsed:
-            print(f"Usage: WRITEMSEED{format_version} <sourceID> <textpayload> [packetID]")
+            self._fail(f"Usage: WRITEMSEED{format_version} <sourceID> <textpayload> [packetID]")
             return
         sourceid, text, pktid = parsed
         suffix = "/MSEED" if format_version == 2 else "/MSEED3"
@@ -513,13 +567,13 @@ class DataLinkShell(cmd.Cmd):
 
         parse_detail = "-p" in arg.split()
         if parse_detail and not _has_pymseed:
-            print("Error: pymseed package is required for -p flag (pip install pymseed)")
+            self._fail("Error: pymseed package is required for -p flag (pip install pymseed)")
             return
 
         try:
             self._ensure_connected()
         except DataLinkError as e:
-            print(f"Error: {e}")
+            self._fail(f"Error: {e}")
             return
 
         self.dl.stream()
@@ -581,7 +635,7 @@ class DataLinkShell(cmd.Cmd):
         """INFO <type> [match] - Request info and print raw XML"""
         parts = arg.split(None, 1)
         if not parts:
-            print("Usage: INFO <type> [match]")
+            self._fail("Usage: INFO <type> [match]")
             return
         info_type = parts[0].upper()
         match_expr = parts[1].strip() if len(parts) > 1 else None
@@ -593,6 +647,13 @@ class DataLinkShell(cmd.Cmd):
     def complete_info(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
         subs = ["STATUS", "STREAMS", "CONNECTIONS"]
         return [s for s in subs if s.lower().startswith(text.lower())]
+
+    def do_bye(self, arg: str) -> bool:
+        """BYE - Send BYE to server, then disconnect and exit"""
+        def run() -> None:
+            self.dl.bye()
+        self._with_reconnect(run)
+        return True
 
     def do_quit(self, arg: str) -> bool:
         """QUIT - Disconnect and exit"""
@@ -632,6 +693,7 @@ class DataLinkShell(cmd.Cmd):
             "  STREAMS [match]            - Print formatted stream list\n"
             "  CONNECTIONS [match]        - Print formatted connection list\n"
             "  INFO <type> [match]        - Request info and print raw XML\n"
+            "  BYE                        - Send BYE to server, then disconnect and exit\n"
             "  QUIT / EXIT                - Disconnect and exit (or Ctrl+D or Ctrl+C)\n"
             "\n"
             "  <time> is epoch microseconds or an ISO 8601 datetime string.\n"
@@ -687,6 +749,33 @@ def main() -> int:
         default=None,
         help="Authenticate with a JWT",
     )
+
+    class _CmdSourceAction(argparse.Action):
+        """Collect -c and -f in declaration order into a single 'command_sources' list."""
+        def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[override]
+            sources = getattr(namespace, "command_sources", None) or []
+            kind = "cmd" if option_string in ("-c", "--command") else "file"
+            sources.append((kind, values))
+            namespace.command_sources = sources
+
+    parser.add_argument(
+        "-c", "--command",
+        action=_CmdSourceAction, default=None, dest="command_sources",
+        metavar="CMD",
+        help="Run a single command non-interactively (repeatable, order preserved with -f)",
+    )
+    parser.add_argument(
+        "-f", "--file",
+        action=_CmdSourceAction, default=None, dest="command_sources",
+        metavar="FILE",
+        help="Read commands from FILE; '#' comments and blank lines are ignored (repeatable)",
+    )
+    parser.add_argument(
+        "-i", "--interactive",
+        action="store_true", default=False,
+        help="Drop into the interactive REPL after non-interactive commands complete",
+    )
+
     args = parser.parse_args()
 
     # Build auth credentials for reconnect
@@ -712,6 +801,27 @@ def main() -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
+    # Build command list from -c/-f sources; fall back to piped stdin if none given.
+    command_sources: list[tuple[str, str]] = args.command_sources or []
+    commands: list[str] = []
+    for kind, value in command_sources:
+        if kind == "cmd":
+            if value.strip():
+                commands.append(value)
+        else:
+            try:
+                with open(value, "r", encoding="utf-8") as fh:
+                    commands.extend(_filter_script_lines(fh))
+            except OSError as e:
+                print(f"Error: cannot read {value!r}: {e}", file=sys.stderr)
+                return 1
+
+    piped_stdin = not command_sources and not sys.stdin.isatty()
+    if piped_stdin:
+        commands.extend(_filter_script_lines(sys.stdin))
+
+    non_interactive = bool(commands)
+
     try:
         dl.connect()
         tls_label = " (TLS)" if dl._tls else ""
@@ -732,11 +842,28 @@ def main() -> int:
                 print("Authenticated with JWT" if resp else f"Auth failed: {resp.message}")
 
         shell = DataLinkShell(dl, auth)
-        print("Type HELP for commands, QUIT to exit.\n")
-        try:
-            shell.cmdloop()
-        except KeyboardInterrupt:
-            print()
+        exit_code = 0
+        stop = False
+
+        # 1. Script commands (fail-fast: stop on first error)
+        for line in commands:
+            if stop:
+                break
+            shell.had_error = False
+            stop = bool(shell.onecmd(shell.precmd(line)))
+            if shell.had_error:
+                exit_code = 1
+                break
+
+        # 2. Interactive REPL: when no commands were given, or when -i and no failure/stop
+        if (not non_interactive) or (args.interactive and exit_code == 0 and not stop):
+            print("Type HELP for commands, QUIT to exit.\n")
+            try:
+                shell.cmdloop()
+            except KeyboardInterrupt:
+                print()
+
+        return exit_code
     except DataLinkError as e:
         msg = str(e)
         if "tls_noverify=True" in msg:
@@ -754,7 +881,6 @@ def main() -> int:
     finally:
         dl.close()
         print("Disconnected.")
-    return 0
 
 
 if __name__ == "__main__":

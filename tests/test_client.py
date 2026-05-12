@@ -31,9 +31,10 @@ class TestParsePacket:
         assert pkt.dataend == 3_000_000
         assert pkt.data == b"payload"
 
-    def test_payload_truncated_to_size(self):
+    def test_payload_exact_size(self):
+        # _recv_packet guarantees data is exactly size bytes; _parse_packet trusts this.
         header = "PACKET sid 1 10 20 30 3"
-        pkt = DataLink._parse_packet(header, b"abcdefg")
+        pkt = DataLink._parse_packet(header, b"abc")
         assert pkt.data == b"abc"
 
     def test_empty_data_when_none(self):
