@@ -283,15 +283,23 @@ def _filter_script_lines(lines: Iterable[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _parse_write_args(arg: str) -> tuple[str, str, int | None] | None:
-    """Parse '<streamID> <textpayload> [packetID]' into (streamid, text, pktid)."""
-    parts = arg.split(None, 2)
+    """Parse '<streamID> <textpayload> [packetID]' into (streamid, text, pktid).
+
+    Only the streamID is split off; the remainder (including internal spaces)
+    is kept as the payload unless its last whitespace-separated token parses
+    as an integer, in which case that token is treated as an explicit packetID.
+    A payload whose final word happens to be an integer cannot be expressed
+    this way (it will be taken as a packetID instead).
+    """
+    parts = arg.split(None, 1)
     if len(parts) < 2:
         return None
-    streamid = parts[0]
-    rest = parts[1] if len(parts) == 2 else parts[2]
-    rest_parts = rest.rsplit(None, 1)
+    streamid, rest = parts[0], parts[1].strip()
+    if not rest:
+        return None
     pktid: int | None = None
     text = rest
+    rest_parts = rest.rsplit(None, 1)
     if len(rest_parts) == 2:
         try:
             pktid = int(rest_parts[1])
@@ -306,7 +314,9 @@ def _parse_write_args(arg: str) -> tuple[str, str, int | None] | None:
 # ---------------------------------------------------------------------------
 
 # None, or ("userpass", user, password), or ("jwt", token)
-AuthCredentials = None | tuple[str, str, str] | tuple[str, str]
+# NOTE: this must evaluate at import time (not just as an annotation), so it
+# relies on the `X | Y` union syntax being valid at runtime (Python 3.10+).
+AuthCredentials = tuple[str, str, str] | tuple[str, str] | None
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +368,7 @@ class DataLinkShell(cmd.Cmd):
                 self._fail(f"Error: {e}")
                 return
             except DataLinkError as e:
-                msg = str(e)
-                if attempt == 0 and ("Connection closed" in msg or "Not connected" in msg):
+                if attempt == 0 and not self.dl.is_connected:
                     try:
                         if self._ensure_connected():
                             tls_label = " (TLS)" if self.dl._tls else ""
@@ -576,34 +585,41 @@ class DataLinkShell(cmd.Cmd):
             self._fail(f"Error: {e}")
             return
 
-        self.dl.stream()
-        print("Streaming... press Enter or Ctrl+C to stop.")
         try:
+            self.dl.stream()
+            print("Streaming... press Enter or Ctrl+C to stop.")
             while True:
-                readable, _, _ = select.select([self.dl._sock, sys.stdin], [], [], 1.0)
-                if sys.stdin in readable:
-                    sys.stdin.readline()
-                    break
-                if self.dl._sock in readable:
-                    header, data = self.dl._recv_packet()
-                    packet_type = header.split(None, 1)[0] if header else ""
-                    if packet_type == "PACKET":
-                        try:
-                            pkt = self.dl._parse_packet(header, data)
-                            _print_packet(pkt)
-                            if parse_detail and pkt.streamid.endswith(("/MSEED", "/MSEED3")):
-                                _print_mseed_detail(pkt.data)
-                        except DataLinkError:
-                            pass
-                    elif packet_type == "ENDSTREAM":
-                        self.dl._streaming = False
-                        print("Server ended stream.")
-                        return
-                    elif packet_type == "ERROR":
-                        resp = self.dl._parse_response(header, data)
-                        raise DataLinkError(resp.message or "Stream error", resp.value)
+                # A single recv can pull several frames off the wire at once;
+                # drain what's already buffered before waiting on select(),
+                # which only reports on data still sitting on the socket.
+                if not self.dl.has_buffered_data:
+                    readable, _, _ = select.select([self.dl._sock, sys.stdin], [], [], 1.0)
+                    if sys.stdin in readable:
+                        sys.stdin.readline()
+                        break
+                    if self.dl._sock not in readable:
+                        continue
+                header, data = self.dl._recv_packet()
+                packet_type = header.split(None, 1)[0] if header else ""
+                if packet_type == "PACKET":
+                    try:
+                        pkt = self.dl._parse_packet(header, data)
+                        _print_packet(pkt)
+                        if parse_detail and pkt.streamid.endswith(("/MSEED", "/MSEED3")):
+                            _print_mseed_detail(pkt.data)
+                    except DataLinkError:
+                        pass
+                elif packet_type == "ENDSTREAM":
+                    self.dl._streaming = False
+                    print("Server ended stream.")
+                    return
+                elif packet_type == "ERROR":
+                    resp = self.dl._parse_response(header, data)
+                    raise DataLinkError(resp.message or "Stream error", resp.value)
         except KeyboardInterrupt:
             print()
+        except DataLinkError as e:
+            self._fail(f"Error: {e}")
         try:
             self.dl.endstream()
             print("Returned to query mode.")
@@ -688,6 +704,8 @@ class DataLinkShell(cmd.Cmd):
             "  WRITE <streamID> <text> [pktID]        - Write a text packet\n"
             "  WRITEMSEED2 <streamID> <text> [pktID]  - Write text as miniSEED v2 (requires pymseed)\n"
             "  WRITEMSEED3 <streamID> <text> [pktID]  - Write text as miniSEED v3 (requires pymseed)\n"
+            "    (if <text> ends in a number it is taken as [pktID]; append a\n"
+            "     non-numeric character to write a payload that ends in digits)\n"
             "  STREAM [-p]                - Start streaming (-p: parse miniSEED detail)\n"
             "  STATUS [match]             - Print formatted server status\n"
             "  STREAMS [match]            - Print formatted stream list\n"
@@ -709,8 +727,15 @@ def main() -> int:
     """Interactive DataLink client entry point."""
     import argparse
 
+    from . import __version__
+
     parser = argparse.ArgumentParser(
         description="Interactive DataLink protocol client.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "server",

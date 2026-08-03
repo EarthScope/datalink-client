@@ -30,3 +30,5 @@ htmlcov/
 # Misc
 *.manifest
 .DS_Store
+TODO
+CLAUDE.md

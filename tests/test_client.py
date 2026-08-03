@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import errno
+import socket
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from datalink_client.client import DataLink
-from datalink_client.protocol import DL_MAGIC, DataLinkError
+from datalink_client.protocol import DL_MAGIC, DataLinkError, DataLinkTimeout
 
 
 def make_client(use_sendmsg: bool = False, buffered: bool = False) -> DataLink:
     """Construct a DataLink with a mocked socket for framing tests."""
     client = DataLink(host="localhost", port=16000, tls=False)
     client._sock = MagicMock()
+    # Default sendmsg behavior: consume every buffer fully in one call (no
+    # partial sends), returning the real byte count rather than a MagicMock.
+    # This matches an ordinary socket and keeps _sendmsg_all's retry loop
+    # from spinning; TestSendmsgPartialSend below exercises real partial sends.
+    client._sock.sendmsg = MagicMock(
+        side_effect=lambda bufs: sum(memoryview(b).nbytes for b in bufs)
+    )
     client._use_sendmsg = use_sendmsg
     if buffered:
         client.begin_batch()
@@ -250,6 +259,29 @@ class TestBufferedFraming:
         client.flush()  # Should not raise.
         client._sock.sendall.assert_not_called()
 
+    def test_flush_raises_and_discards_when_disconnected(self):
+        client = make_client(buffered=True)
+        client._send_packet("ID foo")
+        client._sock = None
+        with pytest.raises(DataLinkError, match="Not connected"):
+            client.flush()
+        assert client._write_buf is None
+
+    def test_execute_flushes_batch_before_reply_expecting_command(self):
+        """A command expecting a reply must not be queued behind batched
+        writes, or it would wait forever for a reply to a request that was
+        never sent."""
+        client = make_client(buffered=True)
+        client._send_packet("WRITE sid 1 2 N 5", b"hello")
+        ok_header = b"OK 0 0"
+        stream = b"DL" + bytes([len(ok_header)]) + ok_header
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        resp = client.match("FDSN:.*")
+        # One sendall for the flushed WRITE, one for MATCH itself.
+        assert client._sock.sendall.call_count == 2
+        assert resp.status == "OK"
+        assert client._write_buf is None
+
     def test_batch_context_manager_flushes_on_exit(self):
         client = make_client()
         with client.batch():
@@ -266,6 +298,38 @@ class TestBufferedFraming:
                 raise RuntimeError("boom")
         # Buffered packet is still flushed on the way out.
         client._sock.sendall.assert_called_once()
+        assert client._write_buf is None
+
+    def test_second_begin_batch_preserves_queued_packets(self):
+        client = make_client(buffered=True)
+        client._send_packet("ID foo")
+        first_buf_id = id(client._write_buf)
+        client.begin_batch()  # second call while already batching
+        assert id(client._write_buf) == first_buf_id
+        client._send_packet("MATCH bar")
+        client.flush()
+        client._sock.sendall.assert_called_once()
+        sent = bytes(client._sock.sendall.call_args[0][0])
+        assert b"ID foo" in sent and b"MATCH bar" in sent
+
+    def test_batch_max_bytes_sends_in_chunks(self):
+        # sendall's argument is the live _write_buf, cleared in place right
+        # after the call, so capture a copy at call time rather than relying
+        # on call_args (which would see the buffer post-clear).
+        client = make_client()
+        sent_chunks: list[bytes] = []
+        client._sock.sendall = MagicMock(side_effect=lambda buf: sent_chunks.append(bytes(buf)))
+        client.begin_batch(max_bytes=15)
+        client._send_packet("ID foo")  # framed: 9 bytes; under threshold
+        assert sent_chunks == []
+        client._send_packet("ID bar")  # cumulative 18 bytes >= 15: auto-flush
+        assert len(sent_chunks) == 1
+        assert len(sent_chunks[0]) == 18
+        assert client._write_buf == bytearray()  # cleared, batching still on
+        client._send_packet("ID baz")
+        client.flush()
+        assert len(sent_chunks) == 2
+        assert len(sent_chunks[1]) == 9
         assert client._write_buf is None
 
 
@@ -337,6 +401,25 @@ class TestFromServerString:
         assert dl._host == "::1"
         assert dl._port == 16000
 
+    def test_bare_ipv6_without_brackets_raises(self):
+        with pytest.raises(ValueError, match="Ambiguous server string"):
+            DataLink.from_server_string("::1")
+
+    def test_host_containing_at_before_port_uses_last_at(self):
+        # rpartition on the *last* '@' keeps a host containing '@' intact,
+        # rather than a global '@'->':' replace mangling it.
+        dl = DataLink.from_server_string("user@example.org@16000")
+        assert dl._host == "user@example.org"
+        assert dl._port == 16000
+
+    def test_port_out_of_range_raises(self):
+        with pytest.raises(ValueError, match="Port out of range"):
+            DataLink.from_server_string("example.com:99999")
+
+    def test_negative_port_raises(self):
+        with pytest.raises(ValueError, match="Port out of range"):
+            DataLink.from_server_string("example.com:-5")
+
     def test_invalid_port_raises(self):
         with pytest.raises(ValueError):
             DataLink.from_server_string("example.com:notaport")
@@ -344,6 +427,261 @@ class TestFromServerString:
     def test_unclosed_bracket_raises(self):
         with pytest.raises(ValueError):
             DataLink.from_server_string("[::1")
+
+
+class TestConnectFailover:
+    """connect() must fall back to the next address, not crash, when
+    socket creation itself fails (e.g. an unsupported address family)."""
+
+    def test_socket_creation_failure_falls_back_to_next_address(self):
+        infos = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 16000, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 16000)),
+        ]
+        attempted: list[int] = []
+
+        def fake_socket(af, socktype, proto):
+            attempted.append(af)
+            if af == socket.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "Address family not supported")
+            return MagicMock()
+
+        with patch("datalink_client.client.socket.getaddrinfo", return_value=infos), \
+                patch("datalink_client.client.socket.socket", side_effect=fake_socket):
+            client = DataLink("example.com", 16000, tls=False)
+            client.connect()  # must not raise UnboundLocalError
+
+        assert attempted == [socket.AF_INET6, socket.AF_INET]
+        assert client.is_connected
+
+    def test_all_addresses_failing_raises_datalinkerror(self):
+        infos = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 16000, 0, 0))]
+
+        def fake_socket(af, socktype, proto):
+            raise OSError(errno.EAFNOSUPPORT, "Address family not supported")
+
+        with patch("datalink_client.client.socket.getaddrinfo", return_value=infos), \
+                patch("datalink_client.client.socket.socket", side_effect=fake_socket):
+            client = DataLink("example.com", 16000, tls=False)
+            with pytest.raises(DataLinkError):
+                client.connect()
+
+
+class TestRecvAllTimeout:
+    def test_clean_timeout_raises_datalinktimeout_without_closing(self):
+        client = make_client()
+        client._sock.recv_into = MagicMock(side_effect=TimeoutError("timed out"))
+        with pytest.raises(DataLinkTimeout):
+            client._recv_all(5)
+        # No bytes were consumed; the stream is still in sync, so the
+        # connection is left open for a subsequent retry.
+        assert client.is_connected
+
+    def test_timeout_after_partial_read_closes_connection(self):
+        client = make_client()
+        client._sock.recv_into = MagicMock(side_effect=[2, TimeoutError("timed out")])
+        with pytest.raises(DataLinkTimeout, match="partial read"):
+            client._recv_all(5)
+        assert not client.is_connected
+
+    def test_datalinktimeout_is_caught_as_datalinkerror(self):
+        client = make_client()
+        client._sock.recv_into = MagicMock(side_effect=TimeoutError("timed out"))
+        with pytest.raises(DataLinkError):
+            client._recv_all(5)
+
+    def test_datalinktimeout_is_caught_as_timeouterror(self):
+        client = make_client()
+        client._sock.recv_into = MagicMock(side_effect=TimeoutError("timed out"))
+        with pytest.raises(TimeoutError):
+            client._recv_all(5)
+
+
+class TestRecvBufShrink:
+    """_recv_buf grows to fit an oversized payload; it must not stay grown
+    for the life of the connection."""
+
+    def test_shrink_on_close_after_oversized_payload(self):
+        client = make_client()
+        big = b"x" * 200_000
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(big))
+        data = client._recv_all(len(big))
+        assert data == big
+        assert len(client._recv_buf) >= len(big)
+        client.close()
+        assert len(client._recv_buf) == 65536
+
+    def test_shrink_lazily_on_next_read_after_buffer_drained(self):
+        client = make_client()
+        big = b"x" * 200_000
+        small = b"y" * 10
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(big + small))
+        client._recv_all(len(big))
+        assert len(client._recv_buf) >= len(big)
+        data = client._recv_all(len(small))
+        assert data == small
+        assert len(client._recv_buf) == 65536
+
+    def test_no_shrink_between_consecutive_large_reads(self):
+        client = make_client()
+        size = 200_000
+        stream = (b"a" * size) + (b"b" * size)
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        first = client._recv_all(size)
+        grown_id = id(client._recv_buf)
+        grown_len = len(client._recv_buf)
+        second = client._recv_all(size)
+        assert first == b"a" * size
+        assert second == b"b" * size
+        # No shrink-then-regrow churn between back-to-back large reads.
+        assert id(client._recv_buf) == grown_id
+        assert len(client._recv_buf) == grown_len
+
+    def test_shrink_survives_reconnect(self):
+        infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 16000))]
+        client = make_client()
+        client._recv_buf = bytearray(200_000)
+        client._recv_view = memoryview(client._recv_buf)
+        with patch("datalink_client.client.socket.getaddrinfo", return_value=infos), \
+                patch("datalink_client.client.socket.socket", return_value=MagicMock()):
+            client.close()
+            client.connect()
+        assert len(client._recv_buf) == 65536
+
+
+class TestConnectClosesOnUnhandledException:
+    def test_non_oserror_from_wrap_socket_still_closes_socket(self):
+        """connect() must close the raw socket even when wrap_socket() raises
+        something other than SSLCertVerificationError or OSError."""
+        infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 16500))]
+        created_socket = MagicMock()
+        fake_context = MagicMock()
+        fake_context.wrap_socket.side_effect = ValueError("boom")
+        with patch("datalink_client.client.socket.getaddrinfo", return_value=infos), \
+                patch("datalink_client.client.socket.socket", return_value=created_socket), \
+                patch("datalink_client.client.ssl.create_default_context", return_value=fake_context):
+            client = DataLink("example.com", 16500, tls=True)
+            with pytest.raises(ValueError):
+                client.connect()
+        created_socket.close.assert_called_once()
+        assert client._sock is None
+
+
+class TestDesyncClosesConnection:
+    def test_bad_preheader_magic_closes_connection(self):
+        client = make_client()
+        bad_header = b"HELLO"
+        stream = b"XX" + bytes([len(bad_header)]) + bad_header
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        with pytest.raises(DataLinkError, match="Invalid preheader magic"):
+            client._recv_packet()
+        assert not client.is_connected
+
+    def test_unrecognized_packet_type_closes_connection(self):
+        client = make_client()
+        header = b"WEIRD 1 2 3"
+        stream = b"DL" + bytes([len(header)]) + header
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        with pytest.raises(DataLinkError, match="Unrecognized packet type"):
+            client._recv_packet()
+        assert not client.is_connected
+
+    def test_non_ascii_header_closes_connection(self):
+        client = make_client()
+        header = b"\xff\xfe garbage"
+        stream = b"DL" + bytes([len(header)]) + header
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        with pytest.raises(DataLinkError, match="not ASCII"):
+            client._recv_packet()
+        assert not client.is_connected
+
+    def test_negative_payload_size_closes_connection(self):
+        client = make_client()
+        header = b"OK 1 -5"
+        stream = b"DL" + bytes([len(header)]) + header
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        with pytest.raises(DataLinkError, match="Negative payload size"):
+            client._recv_packet()
+        assert not client.is_connected
+
+
+class TestHasBufferedData:
+    def test_false_when_buffer_empty(self):
+        client = make_client()
+        assert client.has_buffered_data is False
+
+    def test_true_when_a_second_frame_is_already_buffered(self):
+        client = make_client()
+        header1 = b"OK 1 0"
+        header2 = b"OK 2 0"
+        stream = (
+            b"DL" + bytes([len(header1)]) + header1
+            + b"DL" + bytes([len(header2)]) + header2
+        )
+        # A single recv_into call, as a real socket often would, delivers
+        # both frames at once; has_buffered_data must see the leftover one.
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        client._recv_packet()
+        assert client.has_buffered_data is True
+        client._recv_packet()
+        assert client.has_buffered_data is False
+
+
+class TestCollectDesync:
+    def test_invalid_packet_closes_connection_and_raises(self):
+        client = make_client()
+        client._streaming = True
+        header = b"PACKET sid 1 2 3"  # too few fields for parse_packet
+        stream = b"DL" + bytes([len(header)]) + header
+        client._sock.recv_into = MagicMock(side_effect=_mock_recv_stream(stream))
+        with pytest.raises(DataLinkError, match="Invalid PACKET in stream"):
+            next(client.collect())
+        assert not client.is_connected
+
+
+class TestSendmsgPartialSend:
+    """sendmsg is a single syscall that may transfer fewer bytes than
+    requested; _sendmsg_all must loop until every buffer is fully sent."""
+
+    def test_partial_send_is_retried_until_complete(self):
+        client = make_client(use_sendmsg=True)
+        payload = b"scatter gather payload"
+        header = "WRITE sid 1 2 N 23"
+        header_bytes = header.encode("ascii")
+        expected_frame = b"DL" + bytes([len(header_bytes)]) + header_bytes
+        expected_total = expected_frame + payload
+
+        # Fake a socket that only ever accepts a small, fixed-size chunk per
+        # call (deliberately smaller than either buffer), forcing _sendmsg_all
+        # to loop across several partial sends, including at least one that
+        # splits a single buffer mid-way.
+        sent = bytearray()
+        CHUNK = 7
+
+        def fake_sendmsg(views):
+            remaining = CHUNK
+            n_total = 0
+            for v in views:
+                take = min(remaining, v.nbytes)
+                if take <= 0:
+                    break
+                sent.extend(bytes(v[:take]))
+                n_total += take
+                remaining -= take
+            return n_total
+
+        client._sock.sendmsg = MagicMock(side_effect=fake_sendmsg)
+        client._send_packet(header, payload)
+
+        assert bytes(sent) == expected_total
+        assert client._sock.sendmsg.call_count > 1
+
+    def test_zero_byte_send_raises_and_closes(self):
+        client = make_client(use_sendmsg=True)
+        client._sock.sendmsg = MagicMock(return_value=0)
+        with pytest.raises(DataLinkError, match="0 bytes"):
+            client._send_packet("ID foo")
+        assert not client.is_connected
 
 
 class TestDeprecatedLastPktid:
@@ -364,6 +702,20 @@ def _mock_recv_ok(value: int):
     stream = preheader + header
 
     # recv_into copies bytes into a caller-supplied buffer and returns count.
+    offset = [0]
+
+    def side_effect(buf):
+        remaining = len(stream) - offset[0]
+        n = min(len(buf), remaining)
+        buf[:n] = stream[offset[0]:offset[0] + n]
+        offset[0] += n
+        return n
+
+    return side_effect
+
+
+def _mock_recv_stream(stream: bytes):
+    """Build a recv_into side-effect that serves raw `stream` bytes verbatim."""
     offset = [0]
 
     def side_effect(buf):

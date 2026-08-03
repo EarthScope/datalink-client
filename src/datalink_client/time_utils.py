@@ -27,14 +27,16 @@ def ustime_to_timestring(ustime: int) -> str:
 
 
 def _normalize_timestring(timestring: str) -> str:
-    """Normalize a datetime string to strict ISO 8601 for fromisoformat().
+    """Zero-pad single-digit date/time fields for datetime.fromisoformat().
+
+    fromisoformat() natively accepts a ``Z`` suffix, a space in place of
+    ``T``, 1-6 digit fractional seconds, bare dates, and the "basic" (no
+    separator) format; this only needs to handle what it still rejects: a
+    single-digit month, day, hour, minute, or second.
 
     Handles:
       - Single-digit month/day (2026-2-9 → 2026-02-09)
       - Single-digit hour/minute/second (0:1:1 → 00:01:01)
-      - Space separator instead of T (2026-02-09 16:00 → 2026-02-09T16:00)
-      - Z suffix → +00:00
-      - Date-only strings (2026-02-09 → 2026-02-09T00:00:00)
     """
     s = timestring.strip()
 
@@ -43,20 +45,10 @@ def _normalize_timestring(timestring: str) -> str:
     if m:
         s = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}{m.group(4)}"
 
-    # Replace space separator with T
-    s = re.sub(r"^(\d{4}-\d{2}-\d{2})\s+(\d)", r"\1T\2", s)
-
-    # Zero-pad hour, minute, second: 0:1:1 → 00:01:01
-    m = re.match(r"^(\d{4}-\d{2}-\d{2}T)(\d{1,2}):(\d{1,2}):(\d{1,2})(.*)", s)
+    # Zero-pad hour, minute, second: 0:1:1 → 00:01:01 (T or space separator)
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}[T ])(\d{1,2}):(\d{1,2}):(\d{1,2})(.*)", s)
     if m:
         s = f"{m.group(1)}{int(m.group(2)):02d}:{int(m.group(3)):02d}:{int(m.group(4)):02d}{m.group(5)}"
-
-    # Z suffix → +00:00
-    s = s.replace("Z", "+00:00")
-
-    # Date-only → append T00:00:00
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-        s += "T00:00:00"
 
     return s
 

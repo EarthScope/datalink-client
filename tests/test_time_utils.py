@@ -51,28 +51,40 @@ class TestNormalizeTimestring:
             == "2026-01-01T00:01:01"
         )
 
-    def test_space_separator(self):
+    def test_space_separator_passes_through_unchanged(self):
+        # fromisoformat() accepts a space separator natively (3.11+); the
+        # normalizer only needs to zero-pad, not convert it to 'T'.
         assert (
             _normalize_timestring("2026-02-09 16:22:00")
-            == "2026-02-09T16:22:00"
+            == "2026-02-09 16:22:00"
         )
 
-    def test_z_suffix(self):
+    def test_z_suffix_passes_through_unchanged(self):
+        # fromisoformat() accepts 'Z' natively (3.11+); no substitution needed.
         assert (
             _normalize_timestring("2026-02-09T16:22:00Z")
-            == "2026-02-09T16:22:00+00:00"
+            == "2026-02-09T16:22:00Z"
         )
 
-    def test_date_only(self):
+    def test_date_only_passes_through_unchanged(self):
+        # fromisoformat() accepts a bare date natively (3.11+); no
+        # 'T00:00:00' padding needed.
         assert (
             _normalize_timestring("2026-02-09")
-            == "2026-02-09T00:00:00"
+            == "2026-02-09"
         )
 
     def test_date_only_single_digit(self):
+        # Month/day are still zero-padded; no time portion is appended.
         assert (
             _normalize_timestring("2026-2-9")
-            == "2026-02-09T00:00:00"
+            == "2026-02-09"
+        )
+
+    def test_single_digit_hms_space_separator(self):
+        assert (
+            _normalize_timestring("2026-01-01 0:1:1")
+            == "2026-01-01 00:01:01"
         )
 
     def test_fractional_seconds_preserved(self):
@@ -113,6 +125,9 @@ class TestTimestringToUstime:
 
     def test_date_only(self):
         assert timestring_to_ustime("2025-02-06") == _REF_DATE_ONLY_US
+
+    def test_space_separator(self):
+        assert timestring_to_ustime("2025-02-06 10:30:00Z") == _REF_US
 
     def test_invalid_raises_valueerror(self):
         with pytest.raises(ValueError):

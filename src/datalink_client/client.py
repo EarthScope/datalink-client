@@ -1,39 +1,47 @@
-"""DataLink protocol 1.1 client (query and streaming modes)."""
+"""DataLink protocol 1.1 client (query and streaming modes), socket transport."""
 
 from __future__ import annotations
 
 import contextlib
 import logging
-import os
-import platform
 import socket
 import ssl
-import sys
 import time
 import warnings
-import xml.etree.ElementTree as ET
 from collections.abc import Generator
-from typing import Any, Literal, Union, overload
+from typing import Any, Literal, overload
 
+from . import _commands as commands
+from ._base import _DataLinkBase
+from ._commands import TIME_UNSET_VALUE, Command
 from .protocol import (
-    DL_MAGIC,
-    MAX_HEADER_LEN,
-    PREHEADER_LEN,
+    BufferLike,
     DataLinkError,
     DataLinkPacket,
     DataLinkResponse,
-    typed_attrs,
+    DataLinkTimeout,
+    PREHEADER_LEN,
+    StreamEvent,
+    classify_stream_packet,
+    encode_frame,
+    expect_ok,
+    expected_payload_size,
+    generate_client_id,
+    parse_info_xml,
+    parse_packet,
+    parse_response,
+    validate_preheader_magic,
 )
-from .time_utils import timestring_to_ustime
-
-BufferLike = Union[bytes, bytearray, memoryview]
 
 logger = logging.getLogger(__name__)
 
-TIME_UNSET_VALUE: int = -(2**63)
+# Default/minimum size of the persistent receive buffer. It grows to fit an
+# oversized payload but is released back to this size once drained, so one
+# large packet doesn't pin that memory for the life of the connection.
+_RECV_BUF_SIZE = 65536
 
 
-class DataLink:
+class DataLink(_DataLinkBase):
     """DataLink protocol 1.1 client for query and streaming modes.
 
     Supports all DataLink 1.1 client commands: ID, AUTH (USERPASS/JWT),
@@ -41,6 +49,9 @@ class DataLink:
 
     The connection starts in query mode. Call :meth:`stream` to enter streaming
     mode, and :meth:`endstream` to return to query mode.
+
+    For asyncio-based use, see :class:`~datalink_client.aio.AsyncDataLink`,
+    which offers the same API as coroutines.
 
     Args:
         host:       Server hostname or IP address.
@@ -58,8 +69,6 @@ class DataLink:
                              Keys without values are stored as ``True`` (e.g. ``{'WRITE': True}``).
     """
 
-    TLS_PORT = 16500
-
     def __init__(
         self,
         host: str = "localhost",
@@ -68,75 +77,42 @@ class DataLink:
         tls: bool | None = None,
         tls_noverify: bool = False,
     ):
-        self._host = host
-        self._port = port
-        self._timeout = timeout
-        self._tls = tls if tls is not None else (port == self.TLS_PORT)
-        self._tls_noverify = tls_noverify
+        super().__init__(host, port, timeout=timeout, tls=tls, tls_noverify=tls_noverify)
         self._sock: socket.socket | None = None
-        self._streaming = False
         self._use_sendmsg = False
         self._write_buf: bytearray | None = None
-        self._recv_buf = bytearray(65536)
+        self._batch_max: int | None = None
+        self._recv_buf = bytearray(_RECV_BUF_SIZE)
         self._recv_view = memoryview(self._recv_buf)
         self._recv_start = 0
         self._recv_end = 0
-        self.server_id: str | None = None
-        self.server_capabilities: dict[str, str | bool] = {}
-
-    @classmethod
-    def from_server_string(
-        cls,
-        server: str,
-        timeout: float | None = None,
-        tls: bool | None = None,
-        tls_noverify: bool = False,
-    ) -> DataLink:
-        """Create a DataLink from a server string (host:port, host@port, host, or '')."""
-        host = "localhost"
-        port = 16000
-        server = server.strip()
-        if server:
-            normalized = server.replace("@", ":")
-            if normalized.startswith("["):
-                bracket_end = normalized.find("]")
-                if bracket_end < 0:
-                    raise ValueError(
-                        f"Missing closing bracket in server string: {server!r}"
-                    )
-                host = normalized[1:bracket_end] or "localhost"
-                remainder = normalized[bracket_end + 1 :]
-                if remainder.startswith(":") and remainder[1:]:
-                    try:
-                        port = int(remainder[1:])
-                    except ValueError:
-                        raise ValueError(
-                            f"Invalid port in server string: {server!r}"
-                        ) from None
-            else:
-                parts = normalized.rsplit(":", 1)
-                host = parts[0] or "localhost"
-                if len(parts) == 2 and parts[1]:
-                    try:
-                        port = int(parts[1])
-                    except ValueError:
-                        raise ValueError(
-                            f"Invalid port in server string: {server!r}"
-                        ) from None
-        return cls(host, port, timeout=timeout, tls=tls, tls_noverify=tls_noverify)
 
     @property
     def is_connected(self) -> bool:
         return self._sock is not None
 
     @property
-    def is_streaming(self) -> bool:
-        return self._streaming
+    def has_buffered_data(self) -> bool:
+        """Whether a full frame may be readable without a blocking socket call.
 
-    def __repr__(self) -> str:
-        state = "connected" if self._sock is not None else "disconnected"
-        tls = ", tls" if self._tls else ""
-        return f"DataLink({self._host!r}, {self._port}, {state}{tls})"
+        True if bytes already sit in the internal receive buffer, or (for a
+        TLS socket) in the SSL layer's own decrypted-but-unread buffer.
+        ``select()``/``poll()`` on the raw socket only reports on-wire data,
+        so a caller multiplexing this client's socket with other input
+        (e.g. the CLI's ``STREAM`` command) should drain while this is true
+        before waiting on ``select()`` again.
+        """
+        if self._recv_end > self._recv_start:
+            return True
+        return isinstance(self._sock, ssl.SSLSocket) and self._sock.pending() > 0
+
+    def _reset_recv_buf(self) -> None:
+        """Release an oversized receive buffer back to its default capacity."""
+        if len(self._recv_buf) > _RECV_BUF_SIZE:
+            self._recv_buf = bytearray(_RECV_BUF_SIZE)
+            self._recv_view = memoryview(self._recv_buf)
+        self._recv_start = 0
+        self._recv_end = 0
 
     def connect(self) -> None:
         """Open TCP connection to the DataLink server, optionally with TLS."""
@@ -149,6 +125,7 @@ class DataLink:
             raise DataLinkError(f"Could not resolve address: {self._host}:{self._port}")
         last_err: OSError | None = None
         for af, socktype, proto, _canonname, sockaddr in infos:
+            sock: socket.socket | None = None
             try:
                 sock = socket.socket(af, socktype, proto)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -162,12 +139,11 @@ class DataLink:
                         context.verify_mode = ssl.CERT_NONE
                     sock = context.wrap_socket(sock, server_hostname=self._host)
                 self._sock = sock
-                self._use_sendmsg = not self._tls
-                self._recv_start = 0
-                self._recv_end = 0
+                self._use_sendmsg = not self._tls and hasattr(sock, "sendmsg")
+                self._reset_recv_buf()
+                sock = None  # ownership transferred to self._sock
                 break
             except ssl.SSLCertVerificationError as e:
-                sock.close()
                 raise DataLinkError(
                     f"TLS certificate verification failed for "
                     f"{self._host}:{self._port}: {e.verify_message}. "
@@ -176,7 +152,11 @@ class DataLink:
                 ) from e
             except OSError as e:
                 last_err = e
-                sock.close()
+            finally:
+                # Closes the socket on any failure, including one this loop
+                # doesn't otherwise handle (e.g. a non-OSError from wrap_socket).
+                if sock is not None:
+                    sock.close()
         else:
             raise DataLinkError(
                 f"Could not connect to {self._host}:{self._port}"
@@ -198,33 +178,58 @@ class DataLink:
         self._streaming = False
         self._use_sendmsg = False
         self._write_buf = None
-        self._recv_start = 0
-        self._recv_end = 0
+        self._batch_max = None
+        self._reset_recv_buf()
 
     def reconnect(self) -> None:
         """Close the current connection (if any) and open a fresh one."""
         self.close()
         self.connect()
 
-    def begin_batch(self) -> None:
-        """Enable write buffering. Packets are queued until :meth:`flush` is called."""
-        self._write_buf = bytearray()
+    def begin_batch(self, max_bytes: int | None = None) -> None:
+        """Enable write buffering. Packets are queued until :meth:`flush` is called.
+
+        Calling this while already batching is a no-op that preserves what's
+        already queued (it previously discarded the buffer and any packets
+        in it).
+
+        Args:
+            max_bytes: If set, the buffer is sent to the wire (without
+                ending the batch) whenever it reaches this many bytes, so a
+                long batch doesn't grow unbounded between explicit flushes.
+        """
+        if self._write_buf is None:
+            self._write_buf = bytearray()
+        self._batch_max = max_bytes
+
+    def _send_bytes(self, buf: bytearray) -> None:
+        """Send already-framed bytes to the wire, closing on failure."""
+        if not buf:
+            return
+        if self._sock is None:
+            raise DataLinkError(f"Not connected; discarding {len(buf)} buffered bytes")
+        try:
+            self._sock.sendall(buf)
+        except OSError as e:
+            self.close()
+            raise DataLinkError(f"flush failed: {e}") from e
 
     def flush(self) -> None:
-        """Send all buffered packets and disable buffering."""
+        """Send all buffered packets and disable buffering.
+
+        Raises:
+            DataLinkError: if not connected and packets were buffered (they
+                are discarded, since there is nowhere left to send them).
+        """
         if self._write_buf is None:
             return
         buf = self._write_buf
         self._write_buf = None
-        if buf and self._sock is not None:
-            try:
-                self._sock.sendall(buf)
-            except OSError as e:
-                self.close()
-                raise DataLinkError(f"flush failed: {e}") from e
+        self._batch_max = None
+        self._send_bytes(buf)
 
     @contextlib.contextmanager
-    def batch(self):
+    def batch(self, max_bytes: int | None = None):
         """Context manager for batched writes.
 
         Usage::
@@ -233,8 +238,11 @@ class DataLink:
                 for record in records:
                     dl.write(streamid, start, end, record)
             # flush() is called automatically on exit
+
+        Args:
+            max_bytes: see :meth:`begin_batch`.
         """
-        self.begin_batch()
+        self.begin_batch(max_bytes)
         try:
             yield
         finally:
@@ -247,6 +255,8 @@ class DataLink:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
+    # -- Byte-level transport -----------------------------------------------
+
     def _recv_all(self, n: int) -> bytes:
         if self._sock is None:
             raise DataLinkError("Not connected")
@@ -257,6 +267,11 @@ class DataLink:
             data = bytes(self._recv_view[self._recv_start:self._recv_start + n])
             self._recv_start += n
             return data
+
+        # Buffer is drained and not needed at its current (grown) size: reclaim
+        # the capacity from an earlier oversized payload before refilling.
+        if available == 0 and n <= _RECV_BUF_SIZE:
+            self._reset_recv_buf()
 
         # Grow the persistent buffer if n exceeds its capacity (rare for large payloads).
         if n > len(self._recv_buf):
@@ -279,15 +294,15 @@ class DataLink:
         while self._recv_end - self._recv_start < n:
             try:
                 chunk = self._sock.recv_into(self._recv_view[self._recv_end:])
-            except socket.timeout:
+            except socket.timeout as e:
                 partial = self._recv_end - self._recv_start
                 if partial > 0:
                     self.close()
-                    raise DataLinkError(
+                    raise DataLinkTimeout(
                         f"Timeout after partial read ({partial}/{n} bytes); "
                         "connection closed"
-                    )
-                raise
+                    ) from e
+                raise DataLinkTimeout(f"Timed out waiting for {n} bytes") from e
             except OSError as e:
                 self.close()
                 raise DataLinkError(f"recv failed: {e}") from e
@@ -303,27 +318,21 @@ class DataLink:
     def _send_packet(self, header: str, data: BufferLike | None = None) -> None:
         if self._sock is None:
             raise DataLinkError("Not connected")
-        header_bytes = header.encode("ascii")
-        hlen = len(header_bytes)
-        if hlen > MAX_HEADER_LEN:
-            raise DataLinkError(
-                f"Header length {hlen} exceeds {MAX_HEADER_LEN}"
-            )
-        frame = bytearray(3 + hlen)
-        frame[0:2] = DL_MAGIC
-        frame[2] = hlen
-        frame[3:] = header_bytes
+        frame = encode_frame(header)
         if self._write_buf is not None:
             self._write_buf.extend(frame)
             if data is not None:
                 self._write_buf.extend(data)
+            if self._batch_max is not None and len(self._write_buf) >= self._batch_max:
+                self._send_bytes(self._write_buf)
+                del self._write_buf[:]
             return
         try:
             if self._use_sendmsg:
                 if data is None:
-                    self._sock.sendmsg([frame])
+                    self._sendmsg_all([frame])
                 else:
-                    self._sock.sendmsg([frame, data])
+                    self._sendmsg_all([frame, data])
             else:
                 if data is None:
                     self._sock.sendall(frame)
@@ -336,166 +345,104 @@ class DataLink:
             self.close()
             raise DataLinkError(f"send failed: {e}") from e
 
+    def _sendmsg_all(self, buffers: list[BufferLike]) -> None:
+        """Send all buffers via sendmsg, looping to handle short/partial sends.
+
+        Unlike ``sendall``, ``sendmsg`` is a single syscall that may transfer
+        fewer bytes than requested (e.g. under a socket timeout, or when
+        interrupted by a signal per PEP 475). This loops until every buffer is
+        fully sent, so the peer never sees a truncated frame.
+        """
+        views = [memoryview(b).cast("B") for b in buffers if len(b)]
+        while views:
+            # Pass a snapshot: `views` is mutated below as buffers are
+            # consumed, and callers (real sockets and test doubles alike)
+            # may retain the list reference they were given.
+            sent = self._sock.sendmsg(list(views))
+            if sent <= 0:
+                self.close()
+                raise DataLinkError("send failed: socket accepted 0 bytes")
+            while views and sent >= views[0].nbytes:
+                sent -= views[0].nbytes
+                views.pop(0)
+            if views and sent:
+                views[0] = views[0][sent:]
+
     def _recv_packet(self) -> tuple[str, bytes | None]:
         if self._sock is None:
             raise DataLinkError("Not connected")
         pre = self._recv_all(PREHEADER_LEN)
-        if pre[:2] != DL_MAGIC:
-            raise DataLinkError(f"Invalid preheader magic: {pre[:2]!r}")
+        try:
+            validate_preheader_magic(pre)
+        except DataLinkError as e:
+            self.close()
+            raise DataLinkError(f"{e} Connection closed.") from e
         header_len = pre[2]
         header_bytes = self._recv_all(header_len)
-        header = header_bytes.decode("ascii")
-        parts = header.split(None, 1)
-        packet_type = parts[0] if parts else ""
+        try:
+            header = header_bytes.decode("ascii")
+        except UnicodeDecodeError as e:
+            self.close()
+            raise DataLinkError(f"Header is not ASCII: {header_bytes!r} Connection closed.") from e
+        try:
+            data_size = expected_payload_size(header)
+        except DataLinkError as e:
+            self.close()
+            raise DataLinkError(f"{e} Connection closed.") from e
         data: bytes | None = None
-        data_size = 0
-        if packet_type == "OK" or packet_type == "ERROR":
-            tokens = header.split()
-            if len(tokens) >= 3:
-                try:
-                    data_size = int(tokens[2])
-                except ValueError:
-                    pass
-        elif packet_type == "PACKET":
-            tokens = header.split()
-            if len(tokens) >= 7:
-                try:
-                    data_size = int(tokens[6])
-                except ValueError:
-                    pass
-        elif packet_type == "INFO":
-            tokens = header.split()
-            if len(tokens) >= 3:
-                try:
-                    data_size = int(tokens[2])
-                except ValueError:
-                    pass
-        elif packet_type not in ("ID", "ENDSTREAM"):
-            raise DataLinkError(
-                f"Unrecognized packet type {packet_type!r}; "
-                "cannot determine data payload size, connection may be desynchronized"
-            )
         if data_size > 0:
             data = self._recv_all(data_size)
         return header, data
 
-    def _parse_response(self, header: str, data: bytes | None) -> DataLinkResponse:
-        parts = header.split(None, 2)
-        status = parts[0] if parts else ""
-        value = 0
-        if len(parts) >= 2:
-            try:
-                value = int(parts[1])
-            except ValueError:
-                pass
-        message = data.decode("utf-8", errors="replace") if data else None
-        return DataLinkResponse(status=status, value=value, message=message)
+    # -- Pure parsing, exposed as DataLink methods; protocol.py owns the ----
+    # -- implementation and AsyncDataLink shares the same functions ---------
 
-    def _expect_ok(self, header: str, data: bytes | None) -> DataLinkResponse:
-        resp = self._parse_response(header, data)
-        if resp.status == "ERROR":
-            raise DataLinkError(resp.message or "Server returned ERROR", resp.value)
-        return resp
+    _parse_response = staticmethod(parse_response)
+    _expect_ok = staticmethod(expect_ok)
+    _parse_packet = staticmethod(parse_packet)
+    _parse_info_xml = staticmethod(parse_info_xml)
+    _generate_client_id = staticmethod(generate_client_id)
 
-    @staticmethod
-    def _parse_packet(header: str, data: bytes | None) -> DataLinkPacket:
-        tokens = header.split()
-        if len(tokens) < 7:
-            raise DataLinkError(f"Invalid PACKET header: {header}")
-        try:
-            streamid = tokens[1]
-            pktid = int(tokens[2])
-            pkttime = int(tokens[3])
-            datastart = int(tokens[4])
-            dataend = int(tokens[5])
-            int(tokens[6])  # validate data_size field is numeric
-        except (ValueError, IndexError) as e:
-            raise DataLinkError(f"Invalid PACKET header: {e}") from e
-        payload = data if data is not None else b""
-        return DataLinkPacket(
-            streamid=streamid,
-            pktid=pktid,
-            pkttime=pkttime,
-            datastart=datastart,
-            dataend=dataend,
-            data=payload,
-        )
+    # -- Command dispatch -----------------------------------------------------
 
-    @staticmethod
-    def _generate_client_id(program_name: str | None = None) -> str:
-        if program_name is None:
-            main_module = sys.modules["__main__"]
-            if hasattr(main_module, "__file__"):
-                program_name = os.path.basename(main_module.__file__)
-            else:
-                program_name = "DataLink Client"
-        try:
-            import getpass
-            user = getpass.getuser()
-        except Exception:
-            user = "unknown"
-        pid = os.getpid()
-        arch = platform.platform(terse=True) or platform.system()
-        return f"{program_name}:{user}:{pid}:{arch}"
+    def _execute(self, cmd: Command) -> Any:
+        """Send a Command's request and, if it expects a reply, parse it.
+
+        This is the only place command dispatch differs from
+        :class:`~datalink_client.aio.AsyncDataLink`: everything about what
+        to send and how to interpret the reply lives in ``cmd`` itself.
+        """
+        # A reply-expecting command can't be queued behind batched writes:
+        # there would be nothing on the wire yet for the server to reply to.
+        if cmd.parse is not None and self._write_buf is not None:
+            self.flush()
+        self._send_packet(cmd.header, cmd.payload)
+        if cmd.parse is None:
+            return None
+        header, data = self._recv_packet()
+        return cmd.parse(header, data)
 
     def identify(self, clientid: str | None = None) -> str:
         """Exchange identification with the server and return the server ID string."""
-        cid = self._generate_client_id(clientid)
-        self._send_packet(f"ID {cid}")
-        header, data = self._recv_packet()
-        if not header.startswith("ID "):
-            raise DataLinkError(f"Expected ID reply, got: {header[:50]}")
-        raw = header[3:].strip()
-        self.server_id = raw
-        self.server_capabilities = {}
-        if "::" in raw:
-            caps_str = raw.split("::", 1)[1].strip()
-            for token in caps_str.split():
-                if ":" in token:
-                    key, value = token.split(":", 1)
-                    self.server_capabilities[key] = value
-                else:
-                    self.server_capabilities[token] = True
-        return raw
+        cid = generate_client_id(clientid)
+        raw = self._execute(commands.identify(cid))
+        return self._store_identity(raw)
 
     def auth_userpass(self, username: str, password: str) -> DataLinkResponse:
-        payload = f"{username}\r{password}".encode("utf-8")
-        self._send_packet(f"AUTH USERPASS {len(payload)}", payload)
-        header, data = self._recv_packet()
-        return self._expect_ok(header, data)
+        return self._execute(commands.auth_userpass(username, password))
 
     def auth_jwt(self, token: str) -> DataLinkResponse:
-        payload = token.encode("utf-8")
-        self._send_packet(f"AUTH JWT {len(payload)}", payload)
-        header, data = self._recv_packet()
-        return self._expect_ok(header, data)
+        return self._execute(commands.auth_jwt(token))
 
     def position_set(
         self,
         pktid: str | int,
         uspkttime: int | str = TIME_UNSET_VALUE,
     ) -> DataLinkResponse:
-        if isinstance(uspkttime, str):
-            try:
-                uspkttime = timestring_to_ustime(uspkttime)
-            except ValueError as e:
-                raise DataLinkError(f"Invalid time string {uspkttime!r}: {e}") from e
-        if uspkttime == TIME_UNSET_VALUE:
-            self._send_packet(f"POSITION SET {pktid}")
-        else:
-            self._send_packet(f"POSITION SET {pktid} {uspkttime}")
-        header, data = self._recv_packet()
-        return self._expect_ok(header, data)
+        return self._execute(commands.position_set(pktid, uspkttime))
 
     def position_after(self, ustime: int | str) -> DataLinkResponse:
-        if isinstance(ustime, str):
-            try:
-                ustime = timestring_to_ustime(ustime)
-            except ValueError as e:
-                raise DataLinkError(f"Invalid time string {ustime!r}: {e}") from e
-        self._send_packet(f"POSITION AFTER {ustime}")
-        header, data = self._recv_packet()
-        return self._expect_ok(header, data)
+        return self._execute(commands.position_after(ustime))
 
     def set_position_latest(self) -> int:
         """Set the read position to the latest packet and return its ID.
@@ -526,16 +473,10 @@ class DataLink:
         return self.set_position_latest()
 
     def match(self, pattern: str) -> DataLinkResponse:
-        payload = pattern.encode("utf-8")
-        self._send_packet(f"MATCH {len(payload)}", payload)
-        header, data = self._recv_packet()
-        return self._expect_ok(header, data)
+        return self._execute(commands.match(pattern))
 
     def reject(self, pattern: str) -> DataLinkResponse:
-        payload = pattern.encode("utf-8")
-        self._send_packet(f"REJECT {len(payload)}", payload)
-        header, data = self._recv_packet()
-        return self._expect_ok(header, data)
+        return self._execute(commands.reject(pattern))
 
     @overload
     def write(
@@ -568,35 +509,19 @@ class DataLink:
         ack: bool = False,
         pktid: int | None = None,
     ) -> DataLinkResponse | None:
-        if ack and self._write_buf is not None:
-            self.flush()
-        flags = ("I" if pktid is not None else "") + ("A" if ack else "N")
-        size = len(data)
-        header = f"WRITE {streamid} {datastart} {dataend} {flags} {size}"
-        if pktid is not None:
-            header += f" {pktid}"
-        self._send_packet(header, data)
-        if ack:
-            header_r, data_r = self._recv_packet()
-            return self._expect_ok(header_r, data_r)
-        return None
+        return self._execute(
+            commands.write(streamid, datastart, dataend, data, ack=ack, pktid=pktid)
+        )
 
     def read(self, pktid: int) -> DataLinkPacket:
-        self._send_packet(f"READ {pktid}")
-        header, data = self._recv_packet()
-        if header.startswith("ERROR"):
-            resp = self._parse_response(header, data)
-            raise DataLinkError(resp.message or "READ failed", resp.value)
-        if not header.startswith("PACKET "):
-            raise DataLinkError(f"Expected PACKET reply, got: {header[:50]}")
-        return self._parse_packet(header, data)
+        return self._execute(commands.read(pktid))
 
     def bye(self) -> None:
         """Send a BYE command to gracefully notify the server before disconnecting."""
-        self._send_packet("BYE")
+        self._execute(commands.bye())
 
     def stream(self) -> None:
-        self._send_packet("STREAM")
+        self._execute(commands.stream())
         self._streaming = True
 
     def endstream(self, timeout: float | None = None) -> None:
@@ -607,7 +532,7 @@ class DataLink:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise DataLinkError(
+                raise DataLinkTimeout(
                     f"Timed out after {timeout:.1f}s waiting for ENDSTREAM confirmation"
                 )
             prev_timeout = self._sock.gettimeout() if self._sock else None
@@ -615,89 +540,61 @@ class DataLink:
                 if self._sock is not None:
                     self._sock.settimeout(remaining)
                 header, _ = self._recv_packet()
-            except socket.timeout:
-                raise DataLinkError(
+            except socket.timeout as e:
+                raise DataLinkTimeout(
                     f"Timed out after {timeout:.1f}s waiting for ENDSTREAM confirmation"
-                )
+                ) from e
             finally:
                 if self._sock is not None:
                     self._sock.settimeout(prev_timeout)
-            packet_type = header.split(None, 1)[0] if header else ""
-            if packet_type == "ENDSTREAM":
+            event = classify_stream_packet(header)
+            if event is StreamEvent.ENDSTREAM:
                 self._streaming = False
                 return
-            if packet_type == "PACKET":
+            if event is StreamEvent.PACKET:
                 continue
-            if packet_type == "ERROR":
-                resp = self._parse_response(header, _)
+            if event is StreamEvent.ERROR:
+                resp = parse_response(header, _)
                 raise DataLinkError(resp.message or "ENDSTREAM failed", resp.value)
             logger.debug("Draining unexpected packet during ENDSTREAM: %s", header[:80])
 
     def info(self, info_type: str, match: str | None = None) -> str:
-        if match is not None:
-            match_bytes = match.encode("utf-8")
-            self._send_packet(f"INFO {info_type} {len(match_bytes)}", match_bytes)
-        else:
-            self._send_packet(f"INFO {info_type}")
-        header, data = self._recv_packet()
-        if header.startswith("ERROR"):
-            resp = self._parse_response(header, data)
-            raise DataLinkError(resp.message or "INFO failed", resp.value)
-        if not header.startswith("INFO "):
-            raise DataLinkError(f"Expected INFO reply, got: {header[:50]}")
-        return (data or b"").decode("utf-8", errors="replace")
-
-    @staticmethod
-    def _parse_info_xml(xml_string: str) -> dict[str, Any]:
-        try:
-            root = ET.fromstring(xml_string)
-        except ET.ParseError as e:
-            raise DataLinkError(f"Malformed INFO XML from server: {e}") from e
-        result = typed_attrs(root)
-        status_el = root.find("Status")
-        if status_el is not None:
-            result["Status"] = typed_attrs(status_el)
-        threads_el = root.find("ServerThreads")
-        if threads_el is not None:
-            threads_info = typed_attrs(threads_el)
-            threads_info["Thread"] = [typed_attrs(t) for t in threads_el.findall("Thread")]
-            result["ServerThreads"] = threads_info
-        slist_el = root.find("StreamList")
-        if slist_el is not None:
-            slist_info = typed_attrs(slist_el)
-            slist_info["Stream"] = [typed_attrs(s) for s in slist_el.findall("Stream")]
-            result["StreamList"] = slist_info
-        clist_el = root.find("ConnectionList")
-        if clist_el is not None:
-            clist_info = typed_attrs(clist_el)
-            clist_info["Connection"] = [typed_attrs(c) for c in clist_el.findall("Connection")]
-            result["ConnectionList"] = clist_info
-        return result
+        return self._execute(commands.info(info_type, match))
 
     def info_status(self, match: str | None = None) -> dict[str, Any]:
-        return self._parse_info_xml(self.info("STATUS", match=match))
+        return parse_info_xml(self.info("STATUS", match=match))
 
     def info_streams(self, match: str | None = None) -> dict[str, Any]:
-        return self._parse_info_xml(self.info("STREAMS", match=match))
+        return parse_info_xml(self.info("STREAMS", match=match))
 
     def info_connections(self, match: str | None = None) -> dict[str, Any]:
-        return self._parse_info_xml(self.info("CONNECTIONS", match=match))
+        return parse_info_xml(self.info("CONNECTIONS", match=match))
 
     def collect(self) -> Generator[DataLinkPacket, None, None]:
-        """Streaming generator: yields DataLinkPacket for each received PACKET."""
+        """Streaming generator: yields DataLinkPacket for each received PACKET.
+
+        Abandoning iteration early (``break``, an exception, or simply not
+        exhausting the generator) leaves the connection in streaming mode on
+        the server. Call :meth:`endstream` when done, or wrap the loop in
+        ``contextlib.closing(dl.collect())`` to send ENDSTREAM automatically.
+        """
         while True:
             header, data = self._recv_packet()
-            packet_type = header.split(None, 1)[0] if header else ""
-            if packet_type == "ENDSTREAM":
+            event = classify_stream_packet(header)
+            if event is StreamEvent.ENDSTREAM:
                 self._streaming = False
                 return
-            if packet_type == "PACKET":
+            if event is StreamEvent.PACKET:
                 try:
-                    yield self._parse_packet(header, data)
+                    pkt = parse_packet(header, data)
                 except DataLinkError as e:
-                    logger.warning("Invalid PACKET in stream: %s — %s", header[:80], e)
+                    self.close()
+                    raise DataLinkError(
+                        f"Invalid PACKET in stream (connection closed): {header[:80]} — {e}"
+                    ) from e
+                yield pkt
                 continue
-            if packet_type == "ERROR":
-                resp = self._parse_response(header, data)
+            if event is StreamEvent.ERROR:
+                resp = parse_response(header, data)
                 raise DataLinkError(resp.message or "Stream error", resp.value)
             logger.debug("Unexpected packet in stream: %s", header[:80])

@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.5.0
+
+- Add `AsyncDataLink`, an asyncio-based client offering the same commands as `DataLink`
+  as coroutines (ID, AUTH, POSITION SET/AFTER, MATCH, REJECT, WRITE, READ, STREAM,
+  ENDSTREAM, INFO, `collect()` as an async generator, `batch()` as an async context
+  manager). Import it directly (`from datalink_client import AsyncDataLink`); it is
+  lazily imported so plain `DataLink` usage does not pull in `asyncio`.
+- **Breaking:** raised the Python floor to `>=3.11`, to use `asyncio.timeout()` and the
+  3.11 alignment of `asyncio.TimeoutError` with the builtin `TimeoutError` -- both
+  load-bearing for `AsyncDataLink`'s timeout handling.
+- `write()`'s declared payload size now uses the buffer's actual byte length
+  (`memoryview(...).nbytes`) rather than `len()`, fixing an under-declared size (and a
+  resulting desync) when writing a `memoryview` over a non-byte-sized array.
+- Added a sanity cap on declared reply/packet payload sizes so a corrupt or malicious
+  header cannot force an unbounded buffer wait or allocation.
+- Avoid truncation of payload on CLI `WRITE`/`WRITEMSEED2`/`WRITEMSEED3` commands.
+- Fixed `connect()` raising `UnboundLocalError` (instead of failing over to the next resolved
+  address) when socket creation itself failed for a given address family.
+- Added `DataLinkTimeout` (subclasses both `DataLinkError` and `TimeoutError`) and raised it
+  consistently on socket read timeouts, instead of letting a bare `socket.timeout` escape past
+  the client and CLI into an unhandled traceback.
+- Fixed `_send_packet()`'s `sendmsg` fast path silently accepting a short send (a single
+  syscall with no retry, unlike `sendall`) and desynchronizing the connection; it now loops
+  until every buffer is fully sent. Also stopped assuming `sendmsg` exists on the socket
+  (it doesn't on Windows), falling back to `sendall` there instead of raising `AttributeError`.
+- The client now closes the connection when the protocol stream is detected as
+  desynchronized (bad preheader magic or an unrecognized packet type), instead of leaving a
+  corrupt connection open that the CLI would otherwise treat as still usable.
+- Fixed a batched write deadlocking any subsequent command that expects a reply, by flushing
+  pending batched writes before sending it.
+- Fixed `flush()` silently discarding buffered writes when disconnected; it now raises
+  `DataLinkError` instead of losing data quietly.
+- Fixed a non-numeric or negative declared payload size desyncing the stream instead of
+  raising; also wrapped non-ASCII header encode/decode errors in `DataLinkError` (closing the
+  connection on the decode side) instead of letting a bare `UnicodeError` escape.
+- `collect()` now closes the connection and raises on an invalid `PACKET` header instead of
+  logging a warning and continuing to read an already-desynchronized stream.
+- Fixed `from_server_string()` mishandling a bare (unbracketed) IPv6 host, a `host@port` value
+  containing an extra `@`, and an out-of-range port, instead of silently producing a wrong host
+  or port.
+- Fixed the CLI's `STREAM` command lagging behind incoming packets, since `select()` doesn't
+  see frames already pulled into the client's internal receive buffer; added
+  `DataLink.has_buffered_data` and drain it before waiting on `select()`.
+- Fixed a mid-stream `ERROR` reply (or other failure) in the CLI's `STREAM` command exiting the
+  whole program instead of reporting the error and returning to the prompt.
+- Fixed CLI auto-reconnect only triggering on specific error-message text, missing transport
+  errors like a reset connection; it now reconnects based on connection state instead.
+- Fixed `DataLink`'s persistent receive buffer never shrinking back down after growing to fit
+  an oversized payload, permanently pinning that memory for the life of the connection; it now
+  releases back to its default 64 KiB once drained, and on `close()`.
+- Fixed `connect()` leaking the socket if anything other than `SSLCertVerificationError` or
+  `OSError` was raised while establishing a connection.
+- Fixed `begin_batch()` silently discarding an in-progress batch and its queued packets when
+  called a second time; added an optional `max_bytes` to `begin_batch()`/`batch()` to bound a
+  long batch's memory instead of growing it unboundedly until an explicit `flush()`.
+
 ## 1.4.0
 
 - Add `DataLink.bye()` to send the BYE command; CLI `BYE` command sends it and exits.
