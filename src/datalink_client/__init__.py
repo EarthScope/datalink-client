@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     # AsyncDataLink is actually used.
     from .aio import AsyncDataLink
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 __all__ = [
     "AsyncDataLink",
     "DataLink",

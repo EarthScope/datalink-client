@@ -288,6 +288,7 @@ class TestBatch:
                         received.extend(chunk)
                 except (asyncio.IncompleteReadError, ConnectionError):
                     pass
+                writer.close()
 
             server, port = await _serve_once(handle)
             dl = AsyncDataLink("127.0.0.1", port)
@@ -402,6 +403,7 @@ class TestCancellation:
             async def handle(reader, writer):
                 # Blocks until the client disconnects (never replies).
                 await reader.read(1)
+                writer.close()
 
             server, port = await _serve_once(handle)
             dl = AsyncDataLink("127.0.0.1", port)
@@ -428,6 +430,7 @@ class TestCancellation:
                 # connection open until the client actually disconnects.
                 while await reader.read(4096):
                     pass
+                writer.close()
 
             server, port = await _serve_once(handle)
             dl = AsyncDataLink("127.0.0.1", port)

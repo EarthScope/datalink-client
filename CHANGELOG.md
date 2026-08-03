@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.1
+
+- Fix async tests on python 3.12.
+
 ## 1.5.0
 
 - Add `AsyncDataLink`, an asyncio-based client offering the same commands as `DataLink`
